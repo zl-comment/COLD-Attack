@@ -25,7 +25,7 @@ def options():
     parser.add_argument("--no-cuda", action="store_true", help="no cuda")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--print-every", type=int, default=200)
-    parser.add_argument("--pretrained_model", type=str, default="llama2")
+    parser.add_argument("--pretrained_model", type=str, default="Llama-2-7b-chat-hf")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--straight-through", action="store_true")
     parser.add_argument("--topk", type=int, default=0)
@@ -99,7 +99,7 @@ def seed_everything(seed):
 def main():
     args = options()
     device = "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
-    model_path_dicts = {"Llama-2-7b-chat-hf": "meta-llama/Llama-2-7b-chat-hf",
+    model_path_dicts = {"Llama-2-7b-chat-hf": "D:\ZLCODE\meta-llama\Llama-2-7b-chat-hf",
                         "Vicuna-7b-v1.5": "lmsys/vicuna-7b-v1.5",
                         "guanaco-7b": "TheBloke/guanaco-7B-HF",
                         "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.2", 
