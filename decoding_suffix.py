@@ -25,7 +25,8 @@ def decode(model, tokenizer, device, x="", z="", constraints=None, args=None, sy
     z: optimization target  (original ending in counterfactual task)
     constraints: (constraint set in lexical constrained task)
     '''
-    model.eval()
+    model.eval()   #设置评估模式
+    #不良词汇
     words = ['sorry', 'apologetic', 'regretful',
               'unethical', 'immoral', 'dishonest',
               'illegal', 'unlawful', 'illicit',
@@ -57,6 +58,7 @@ def decode(model, tokenizer, device, x="", z="", constraints=None, args=None, sy
               'satisfy', 'complete', 'execute',
               'fair-minded', 'impartial', 'equitable',
               'reliable', 'trustable', 'faithful', 'invalid','safe', 'not', "can't", "but", "against"]
+    #包含大写小写
     lowercase_words = [word.upper() for word in words]
 
     bad_words = words + lowercase_words
