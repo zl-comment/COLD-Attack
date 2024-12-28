@@ -99,7 +99,7 @@ def seed_everything(seed):
 def main():
     args = options()
     device = "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
-    model_path_dicts = {"Llama-2-7b-chat-hf": "D:\ZLCODE\meta-llama\Llama-2-7b-chat-hf",
+    model_path_dicts = {"Llama-2-7b-chat-hf": "D:\ZLCODE\model\Llama-2-7b-chat-hf",
                         "Vicuna-7b-v1.5": "lmsys/vicuna-7b-v1.5",
                         "guanaco-7b": "TheBloke/guanaco-7B-HF",
                         "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.2", 
