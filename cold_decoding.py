@@ -98,6 +98,22 @@ def seed_everything(seed):
 
 def main():
     args = options()
+    # 设置 GPU 0
+    if torch.cuda.is_available():
+        # 获取可用的 GPU 数量
+        available_gpus = torch.cuda.device_count()
+
+        # 如果有可用的 GPU，选择第一个可用的 GPU
+        if available_gpus > 0:
+            # 自动选择第一个可用的 GPU
+            torch.cuda.set_device(0)
+            print(f"Using GPU {torch.cuda.current_device()}: {torch.cuda.get_device_name(0)}")
+        else:
+            print("No GPUs are available.")
+    else:
+        print("CUDA is not available, using CPU instead.")
+
+
     device = "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
     model_path_dicts = {"Llama-2-7b-chat-hf": "D:\ZLCODE\model\Llama-2-7b-chat-hf",
                         "Vicuna-7b-v1.5": "lmsys/vicuna-7b-v1.5",
