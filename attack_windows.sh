@@ -24,4 +24,5 @@
     --stepsize-ratio 1 `
     --batch-size 8 `
     --print-every 1000 `
-    --fp16
+    --fp16 `
+    --wandb
