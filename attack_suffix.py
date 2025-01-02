@@ -5,13 +5,17 @@ from nltk.corpus import stopwords
 
 from util import *
 
+import os.path as osp
+
 from util import _get_keywords
+
+
 
 stop_words = set(stopwords.words('english'))
 
 from decoding_suffix import decode
 
-def attack_generation(model, tokenizer, device, args, model_back=None):
+def attack_generation(model, tokenizer, device, args, model_back=None, ppl_last=None):
     
     data = pd.read_csv("./data/advbench/harmful_behaviors_custom.csv")
 
@@ -32,7 +36,7 @@ def attack_generation(model, tokenizer, device, args, model_back=None):
         os.makedirs(fw)
 
     procssed = set()
-    ppls = []
+    ppls=[]   #一开始为空
     outputs = []
     prompts = []
     prompts_with_adv = []
@@ -67,8 +71,17 @@ def attack_generation(model, tokenizer, device, args, model_back=None):
             outputs.extend(decoded_text) 
             prompts.extend([x] * args.batch_size)
             prompts_with_adv.extend(p_with_adv)
+            ppls.extend(_)
             results = pd.DataFrame()
             results["prompt"] = [line.strip() for line in prompts] 
             results["prompt_with_adv"] = prompts_with_adv           
             results["output"] = outputs                            
-            results["adv"] = text_complete_candidates                                               
+            results["adv"] = text_complete_candidates
+            results["ppl"] = ppls
+        print(results)    
+
+
+    if osp.exists(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv"):
+        results.to_csv(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv", mode='a', header=False)
+    else:
+        results.to_csv(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv", mode='w')
