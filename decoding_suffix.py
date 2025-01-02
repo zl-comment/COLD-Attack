@@ -22,7 +22,7 @@ from matplotlib import pyplot as plt
 
 from tqdm import tqdm
 #新添加的import
-from model.huggingface as FineTuneConfig
+from model.huggingface import FineTuneConfig
 
 stop_words = set(stopwords.words('english'))
 
