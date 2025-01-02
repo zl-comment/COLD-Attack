@@ -5,6 +5,7 @@ import numpy as np
 import tqdm
 import json
 import argparse
+from collections import defaultdict
 import os
 import os.path as osp
 from util import *
@@ -115,12 +116,26 @@ def merge_csv(args):
 
 def run(args):
     # Load the model and tokenizer
+    if torch.cuda.is_available():
+        # 获取可用的 GPU 数量
+        available_gpus = torch.cuda.device_count()
 
-    model_name = "lmsys/vicuna-7b-v1.5"
+        # 如果有可用的 GPU，选择第一个可用的 GPU
+        if available_gpus > 0:
+            # 自动选择第一个可用的 GPU
+            torch.cuda.set_device(0)
+            print(f"Using GPU {torch.cuda.current_device()}: {torch.cuda.get_device_name(0)}")
+        else:
+            print("No GPUs are available.")
+    else:
+        print("CUDA is not available, using CPU instead.")
+
+
+    model_name = "D:/ZLCODE/model/vicuna-7b-v1.5"
     gpt_model, gpt_tokenizer = load_model_and_tokenizer(model_name,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
-                                                device="cuda")
+                                                 device = "cuda" )
 
     
     data = pd.read_csv("./data/advbench/harmful_behaviors.csv")
@@ -129,7 +144,8 @@ def run(args):
     
     # results = merge_csv(args)
     # results = results.groupby('prompt')
-    success_samples = pd.DataFrame(columns=['prompt', 'prompt_with_adv', 'output', 'adv', 'ppl'])
+    #prompt=goal 
+    success_samples = pd.DataFrame(columns=['prompt', 'prompt_with_adv', 'output', 'adv', 'ppl']) 
 
     total_success = 0
 
@@ -146,6 +162,7 @@ def run(args):
         ref = defaultdict(lambda: [])
         for i, goal in enumerate(goals):
             sub_results = results[results['prompt'] == goal]
+            # print(sub_results)
             # rank the goal with ppl
             success_match = 0
             
@@ -153,6 +170,7 @@ def run(args):
              
             for index, row in sub_results.iterrows():
                 prompt_with_adv = row['prompt_with_adv']
+                #计数
                 adv = row['adv'] # paraphrase之后的文本
                 gts[i].extend([adv])
                 # calculate score here:
@@ -182,10 +200,8 @@ def run(args):
             if success_match > 0:
                 total_success += 1
             # print("succeed:", success_match)
-        # print(ref)
-        # print(gts)
-        Score = Scorer(ref, gts)
-        Score.compute_scores()
+        # Score = Scorer(ref, gts)
+        # Score.compute_scores()
         print("Attack Success Rate: ", total_success / (args.end - args.start + 1))
         print("PPL:", sum(ppls_prompt_adv) / len(ppls_prompt_adv))
     
@@ -197,6 +213,6 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained-model", type=str, default="llama2")
     parser.add_argument("--start", type=int, default=1, help="loading data from ith examples.")
     parser.add_argument("--end", type=int, default=10, help="loading data util ith examples.")
+    parser.add_argument("--defense-method", type=str, default="none")
     args = parser.parse_args()
     run(args)
-    
