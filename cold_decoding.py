@@ -42,7 +42,7 @@ def options():
     parser.add_argument("--end", type=int, default=10, help="loading data util ith examples.")
     parser.add_argument("--repeat-batch", type=int, default=1, help="loading data util ith examples.")
     parser.add_argument("--mode", type=str, default='constrained_langevin',
-                        choices=['suffix', 'control', 'paraphrase'])
+                        choices=['suffix', 'control', 'paraphrase','proxy'])
     parser.add_argument("--control-type", type=str, default='sentiment', choices=['sentiment', 'lexical', 'style', 'format'])
     ## model
     parser.add_argument("--batch-size", type=int, default=1)
@@ -83,6 +83,9 @@ def options():
     parser.add_argument("--gs_std", type=float, default=0.01)
     parser.add_argument("--large-noise-iters", type=str, default="-1", help="Example: '50,1000'")
     parser.add_argument("--large_gs_std", type=str, default="1", help="Example: '1,0.1'")
+    # 代理模型地址
+    parser.add_argument("--proxy_model", type=str, default="vicuna-7b-v1.5")
+    parser.add_argument("--proxy_model_path", type=str)
 
     args = parser.parse_args()
     return args
@@ -124,17 +127,22 @@ def main():
     if args.seed != -1:
         seed_everything(args.seed)
     # Load pretrained model
-    model, tokenizer = load_model_and_tokenizer(model_path,
+    if "proxy" not in args.mode:
+        model, tokenizer = load_model_and_tokenizer(model_path,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
                                                 device=device)
 
-    # Freeze GPT-2 weights
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
-   
+        # Freeze GPT-2 weights
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
 
+
+
+
+   
+    print(args.mode)
     if "suffix" in args.mode:
         from attack_suffix import attack_generation
         attack_generation(model, tokenizer, device, args)
@@ -144,6 +152,9 @@ def main():
     elif "control" in args.mode:
         from attack_control import attack_generation
         attack_generation(model, tokenizer, device, args)
+    elif "proxy" in args.mode:
+        from attack_suffix_proxy import attack_generation   ##再添加一个代理模型
+        attack_generation(model_path, device, args)
 
 if __name__ == "__main__":
     main()
