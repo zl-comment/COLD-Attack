@@ -138,7 +138,7 @@ def run(args):
                                                  device = "cuda" )
 
     
-    data = pd.read_csv("./data/advbench/harmful_behaviors.csv")
+    data = pd.read_csv("./data/advbench/harmful_behaviors_custom.csv")
 
     goals = data['goal'].tolist()[args.start:args.end+1]
     
@@ -161,6 +161,7 @@ def run(args):
         gts = defaultdict(lambda: [])
         ref = defaultdict(lambda: [])
         for i, goal in enumerate(goals):
+            # print(i, goal)
             sub_results = results[results['prompt'] == goal]
             # print(sub_results)
             # rank the goal with ppl
@@ -200,8 +201,8 @@ def run(args):
             if success_match > 0:
                 total_success += 1
             # print("succeed:", success_match)
-        # Score = Scorer(ref, gts)
-        # Score.compute_scores()
+        Score = Scorer(ref, gts)
+        Score.compute_scores()
         print("Attack Success Rate: ", total_success / (args.end - args.start + 1))
         print("PPL:", sum(ppls_prompt_adv) / len(ppls_prompt_adv))
     
