@@ -86,12 +86,12 @@ def attack_generation(model_path, device, args, model_back=None, ppl_last=None):
         print(results)
 
         # 检查文件是否存在
-        if osp.exists(f"outputs/{args.proxy_model}/{args.start}_{args.end}.csv"):
+        if osp.exists(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv"):
             # 如果文件存在，直接覆盖写（会覆盖原有内容，写入新内容）
-            results.to_csv(f"outputs/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
+            results.to_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
         else:
             # 如果文件不存在，创建新文件并写入（会写入列头）
-            results.to_csv(f"outputs/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
+            results.to_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
         # for _ in range(args.repeat_batch):
         #     try:
         #         # 在这里调用 decode 函数，捕获可能的异常
@@ -128,12 +128,12 @@ def attack_generation(model_path, device, args, model_back=None, ppl_last=None):
         #     # 保存每个循环的结果
         #     try:
         #         # 检查文件是否存在
-        #         if osp.exists(f"outputs/{args.proxy_model}/{args.start}_{args.end}.csv"):
+        #         if osp.exists(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv"):
         #             # 如果文件存在，直接覆盖写（会覆盖原有内容，写入新内容）
-        #             results.to_csv(f"outputs/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
+        #             results.to_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
         #         else:
         #             # 如果文件不存在，创建新文件并写入（会写入列头）
-        #             results.to_csv(f"outputs/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
+        #             results.to_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
         #     except Exception as e:
         #         # 如果在保存时发生异常，捕获并打印错误信息
         #         print(f"Error occurred while saving the results: {e}")
