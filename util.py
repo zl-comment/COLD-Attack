@@ -448,6 +448,23 @@ def soft_forward(model, x_onehot, y_logits, topk, extra_mask=None, x_past=None, 
     :param y_logits:
     :return:
     '''
+    # print(f"x_onehot shape: {x_onehot.shape if x_onehot is not None else None}")
+    # print(f"y_logits shape: {y_logits.shape}")
+    # print(f"Embedding shape: {model.get_input_embeddings().weight.shape}")
+
+    #gpt-j-6b的矩阵大小和词表大小不一样  ：将词表大小生成的x_onehot扩展到矩阵大小
+    # if y_logits.shape[-1] != x_onehot.shape[-1]:
+    #     target_vocab_size = y_logits.shape[-1]
+    #     x_onehot_vocab_size = x_onehot.shape[-1]
+    #
+    #     if x_onehot_vocab_size < target_vocab_size:
+    #         # 扩大 x_onehot 的最后一维，填充 0
+    #         padding = torch.zeros(x_onehot.shape[0], x_onehot.shape[1], target_vocab_size - x_onehot_vocab_size).to(
+    #             x_onehot.device)
+    #         x_onehot = torch.cat((x_onehot, padding), dim=-1)
+    #
+    #     print(f"x_onehot expanded to: {x_onehot.shape}")
+
     xy_embeds = embed_inputs(
         model.get_input_embeddings().weight,
         y_logits,
@@ -510,6 +527,13 @@ def soft_forward_xyz(model, x_onehot, y_logits, z_onehot):
     :param y_logits:
     :return:
     '''
+    #
+    # print("Shape of model.get_input_embeddings().weight:", model.get_input_embeddings().weight.shape)
+    # print("Shape of y_logits:", y_logits.shape)
+    # print("Shape of x_onehot:", x_onehot.shape)
+    # print("Shape of z_onehot:", z_onehot.shape)
+    # print("Shape of device (y_logits.device):", y_logits.device)
+
     xyz_embeds = embed_inputs(
         model.get_input_embeddings().weight,
         y_logits,
