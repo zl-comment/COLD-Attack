@@ -64,8 +64,13 @@ def score(cands, refs, bert="bert-base-multilingual-cased",
     P = all_preds[:, 0].cpu()
     R = all_preds[:, 1].cpu()
     F1 = all_preds[:, 2].cpu()
+    #去掉nan影响计算
+    P[torch.isnan(P)] = 0.0
+    R[torch.isnan(R)] = 0.0
+    F1[torch.isnan(F1)] = 0.0
     if verbose:
         print('done in {:.2f} seconds'.format(time.perf_counter() - start))
+
 
     return P, R, F1
 
