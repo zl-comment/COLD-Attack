@@ -28,6 +28,7 @@ class BertScore:
             ref_input += ref
             same_indices.append(len(ref_input))
 
+
         p, r, f_scores = score(hyp_input, ref_input, bert="bert-base-uncased")
  
         prev_idx = 0
@@ -36,7 +37,9 @@ class BertScore:
             aggreg_f1_scores.append(f_scores[prev_idx: idx].mean().cpu().item())
             prev_idx = idx
 
-        return sum(aggreg_f1_scores)/len(aggreg_f1_scores), aggreg_f1_scores
+        aggreg_f1_score=sum(aggreg_f1_scores)/len(aggreg_f1_scores)
+
+        return aggreg_f1_score, aggreg_f1_scores
 
     def method(self):
         return "Bert Score"
