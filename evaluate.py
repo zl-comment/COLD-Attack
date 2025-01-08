@@ -132,10 +132,11 @@ def run(args):
 
 
     model_name = "D:/ZLCODE/model/vicuna-7b-v1.5"
+    # 加载模型
     gpt_model, gpt_tokenizer = load_model_and_tokenizer(model_name,
-                                                low_cpu_mem_usage=True,
-                                                use_cache=False,
-                                                 device = "cuda" )
+                                                        low_cpu_mem_usage=True,
+                                                        use_cache=False,
+                                                        device="cuda")
 
     
     data = pd.read_csv("./data/advbench/harmful_behaviors_custom.csv")
@@ -168,7 +169,7 @@ def run(args):
             success_match = 0
             
             ref[i].extend([goal]) #被paraphrase的文本
-             
+
             for index, row in sub_results.iterrows():
                 prompt_with_adv = row['prompt_with_adv']
                 #计数
@@ -185,9 +186,14 @@ def run(args):
                 prompt_with_adv = prompt_with_adv.strip(" ")
                 prompt_with_adv = remove_special_characters(prompt_with_adv)
                 # ppl = row['ppl']
-                
+                #加载模型
+
+
                 output = row['output']
                 ppl_prompt_adv = get_gpt_ppl([prompt_with_adv], gpt_model, gpt_tokenizer, "cuda:0")
+
+
+
                 ppls_prompt_adv.extend(ppl_prompt_adv)
 
                 if type(output) == float:
@@ -201,6 +207,11 @@ def run(args):
             if success_match > 0:
                 total_success += 1
             # print("succeed:", success_match)
+            # 销毁模型
+        del gpt_model
+        del gpt_tokenizer
+        torch.cuda.empty_cache()
+
         Score = Scorer(ref, gts)
         Score.compute_scores()
         print("Attack Success Rate: ", total_success / (args.end - args.start + 1))

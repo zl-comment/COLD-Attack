@@ -31,8 +31,12 @@ stop_words = set(stopwords.words('english'))
 
 # 设置日志记录器
 def setup_logger(args):
+    # 检查是否已经配置过日志
+    if logging.getLogger().hasHandlers():
+        return logging.getLogger()
+
     # 创建logs目录（如果不存在）
-    log_dir = os.path.join('outputs', 'Llama-2-7b-chat-hf', 'logs')
+    log_dir = os.path.join('outputs', args.proxy_model, 'logs')
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     
@@ -53,7 +57,36 @@ def setup_logger(args):
     )
     return logging.getLogger()
 
-
+#设置代理logit映射到目标logit
+def filter_logits_for_target_model(logits, target_vocab_size, target_vocab):
+    """
+    将代理模型的logits映射到目标模型词汇表范围内。
+    logits: 代理模型生成的token ids (batch_size, seq_len)
+    target_vocab_size: 目标模型词汇表的大小
+    target_vocab: 目标模型的词汇表字典
+    """
+    # 确保输入是PyTorch tensor
+    if not torch.is_tensor(logits):
+        logits = torch.tensor(logits)
+    
+    # 获取设备
+    device = logits.device
+    
+    # 创建一个新的tensor来存储映射后的logits
+    batch_size, seq_len = logits.shape
+    mapped_logits = torch.zeros((batch_size, seq_len), device=device)
+    
+    # 对每个位置的logit进行映射
+    for i in range(batch_size):
+        for j in range(seq_len):
+            token_id = int(logits[i, j])
+            # 如果token_id超出目标词汇表范围，使用取模操作映射到有效范围
+            if token_id >= target_vocab_size:
+                mapped_logits[i, j] = token_id % target_vocab_size
+            else:
+                mapped_logits[i, j] = token_id
+    
+    return mapped_logits.long()
 
 def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None, model_back=None, zz=None):
 
@@ -61,7 +94,7 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
     #加载代理模型
     proxy_model,proxy_tokenizer = load_proxy_model(args.proxy_model_path,  device=device)
     #加载代理模型系统提示词
-    proxy_system_prompt="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed,"+" and polite answers to the user's questions."
+    proxy_system_prompt="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed and polite answers to the user's questions."
     text, _, last_text_ids=decode_proxy(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
     
     # Clean up proxy model GPU memory
@@ -76,6 +109,9 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
                                                 device=device)
     #目标模型评估模式
     model.eval()
+
+    last_text_ids=filter_logits_for_target_model(last_text_ids,tokenizer.vocab_size, tokenizer.get_vocab())
+
     text_post = text
     decoded_text = []
     # 对每个batch生成完整文本
@@ -86,7 +122,8 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
         output_ids = output_ids[:, input_ids.shape[1]:]
         text_dec = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         decoded_text.append(text_dec.strip())
-    
+
+    # print(last_text_ids)
     # 计算最终的困惑度得分
     last_rank_loss = model(input_ids=last_text_ids, labels=last_text_ids).loss
     last_rank_loss = last_rank_loss.detach().clone().data.cpu().numpy()
@@ -167,11 +204,16 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     else:
         x_ = tokenizer.encode(x)[1:]
     x_t = torch.tensor(x_, device=device, dtype=torch.long)
-    x_onehot = one_hot(x_t, dimension=tokenizer.vocab_size)
+    x_onehot = one_hot(x_t, dimension=len(tokenizer))
+
+    # if 'MindLLM-1b3' in args.proxy_model or 'gpt-j-6b' in args.proxy_model:    #填充零
+    #     x_onehot = F.pad(x_onehot, (0, model.get_input_embeddings().weight.size(0) - len(tokenizer)))
+
 
     # repeat batch_size times
     x_t = x_t.unsqueeze(0).repeat(args.batch_size, 1)
     x_onehot = x_onehot.repeat(args.batch_size, 1, 1)
+    # print(f"x_onehot shape: {x_onehot.shape if x_onehot is not None else None}")
 
     z_mask = None
     x_mask = None
@@ -179,7 +221,11 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     z_ = tokenizer.encode(z)[1:]  
     z_t = torch.tensor(z_, device=device, dtype=torch.long)
 
-    z_onehot = one_hot(z_t, dimension=tokenizer.vocab_size)
+    z_onehot = one_hot(z_t, dimension=len(tokenizer))
+
+    # if 'MindLLM-1b3' in args.proxy_model or 'gpt-j-6b' in args.proxy_model:     #填充零
+    #     z_onehot = F.pad(z_onehot, (0, model.get_input_embeddings().weight.size(0) - len(tokenizer)))
+
     z_onehot = z_onehot.repeat(args.batch_size, 1, 1)
 
     z_t = z_t.unsqueeze(0).repeat(args.batch_size, 1)
@@ -199,7 +245,11 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     z_nonstop_ = tokenizer.encode(z_nonstop_words)
     logger.info('|' + z_nonstop_words + '|')
 
-    z_mask = np.zeros([tokenizer.vocab_size])
+    if 'MindLLM-1b3'  in args.proxy_model:
+        z_mask = np.zeros([model.get_input_embeddings().weight.size(0)])
+    else:
+        z_mask = np.zeros([len(tokenizer)])
+
     z_mask[z_nonstop_] = 1.
     z_mask = torch.tensor(z_mask, device=device)
     z_mask = z_mask.unsqueeze(0).unsqueeze(0).repeat(args.batch_size, length, 1)
@@ -211,9 +261,15 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
         length = x_t.shape[1] - length
 
     x_words = tokenizer.encode(bad_words)
-    x_mask = np.zeros([tokenizer.vocab_size])
+
+    if 'MindLLM-1b3' in args.proxy_model or 'gpt-j-6b' in args.proxy_model:
+        x_mask = np.zeros([model.get_input_embeddings().weight.size(0)])
+    else:
+        x_mask = np.zeros([len(tokenizer)])
+
     x_mask[x_words] = 1.
     x_mask = torch.tensor(x_mask, device=device)
+
 
     bad_mask = x_mask.unsqueeze(0).unsqueeze(0).repeat(args.batch_size, length, 1)
 
@@ -222,17 +278,19 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     bad_words_ = tokenizer.encode(bad_words)[:]  # delete the "." token we appended before
     bad_words_t = torch.tensor(bad_words_, device=device, dtype=torch.long)
 
-    bad_words_onehot = one_hot(bad_words_t, dimension=tokenizer.vocab_size)
+    bad_words_onehot = one_hot(bad_words_t, dimension=len(tokenizer))
     bad_words_onehot = bad_words_onehot.repeat(args.batch_size, 1, 1)
 
     bad_words_t = bad_words_t.unsqueeze(0).repeat(args.batch_size, 1)
 
 
-    ###################################################
+
+    ##############################################################################################
 
     # 根据初始化模式选择初始logits
     if args.init_mode == 'original':
         # 使用模型初始化logits unitl中  x_t已经变成批次的输入了
+        # print(x_t)
         init_logits = initialize(model, x_t, length, args.init_temp, args.batch_size ,device, tokenizer)
     else:
         # 使用one-hot向量初始化logits
@@ -242,7 +300,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
         if length > init_logits.shape[1]:
             init_logits = torch.cat(
                 [init_logits,
-                 torch.zeros([args.batch_size, length - init_logits.shape[1], tokenizer.vocab_size], device=device)],
+                 torch.zeros([args.batch_size, length - init_logits.shape[1], len(tokenizer)], device=device)],
                 dim=1)
     
     # 从初始logits生成文本并打印 util.get_text_from_logits根据使用模型的tokenizer
@@ -312,8 +370,8 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
                 soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
             else:
                 soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask, bad_mask=None) / 0.001
-            
-        
+
+        # print(f"soft_forward_x shape: {soft_forward_x.shape if soft_forward_x is not None else None}")
         # 使用模型前向传播
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
