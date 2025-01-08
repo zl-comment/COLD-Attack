@@ -6,7 +6,7 @@ import wandb
 import logging
 import os
 from datetime import datetime
-
+from transformers import DynamicCache
 from nltk import tokenize
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
@@ -21,6 +21,7 @@ import seaborn as sns
 import copy
 
 from matplotlib import pyplot as plt
+import torch.nn.functional as F
 
 from tqdm import tqdm
 #新添加的import
@@ -36,7 +37,7 @@ def setup_logger(args):
         return logging.getLogger()
 
     # 创建logs目录（如果不存在）
-    log_dir = os.path.join('outputs', args.proxy_model, 'logs')
+    log_dir = os.path.join('outputs',args.pretrained_model, args.proxy_model, 'logs')
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     
@@ -56,6 +57,23 @@ def setup_logger(args):
         ]
     )
     return logging.getLogger()
+
+
+# KL散度损失
+def compute_kl_loss(p_logits, q_logits, reduction="batchmean"):
+    """
+    p_logits: 第一个分布的logits (通常是目标分布的logits)
+    q_logits: 第二个分布的logits (通常是模型生成的logits)
+    reduction: 损失的归约方式，"batchmean" 是标准用法
+    """
+    p_prob = F.softmax(p_logits, dim=-1)  # 将logits转为概率分布
+    q_log_prob = F.log_softmax(q_logits, dim=-1)  # 将logits转为对数概率分布
+
+    # KL散度
+    kl_loss = F.kl_div(q_log_prob, p_prob, reduction=reduction)
+    return kl_loss
+
+
 
 #设置代理logit映射到目标logit
 def filter_logits_for_target_model(logits, target_vocab_size, target_vocab):
@@ -351,25 +369,29 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 
     mask_t = None
 
+    EPS = 1e-10
+    TEMPERATURE = 0.1
+
     # 主优化循环
     for iter in tqdm(range(args.num_iters), desc="Processing Goals"):
         # 你的逻辑代码
         print(f"Processing iteration {iter}")
         optim.zero_grad()  # 清除梯度
 
-        # 将扰动加到logits上
-        y_logits_ = y_logits + epsilon
+        # 将扰动加到logits上，添加数值稳定性处理
+        y_logits_ = y_logits + epsilon + EPS
         
+        # 使用更稳定的温度参数进行缩放
+        soft_forward_y = y_logits_ / TEMPERATURE  # 使用更稳定的温度值
         
-        soft_forward_y = y_logits_ / 0.001  # 温度缩放
-        
-        
-        # 直通估计器(Straight-through estimator)处理 为了前向传播
+        # 直通估计器处理
         if args.straight_through:
             if mask_t is None:
-                soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
+                # 使用更稳定的温度参数
+                soft_forward_y = (y_logits_.detach() / TEMPERATURE - y_logits_).detach() + y_logits_
             else:
-                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask, bad_mask=None) / 0.001
+                # 使用更稳定的温度参数
+                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask, bad_mask=None) / TEMPERATURE
 
         # print(f"soft_forward_x shape: {soft_forward_x.shape if soft_forward_x is not None else None}")
         # 使用模型前向传播
@@ -387,13 +409,13 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
             _, indices_t = torch.topk(y_logits_t, args.topk)
             mask_t = torch.zeros_like(y_logits_t).scatter_(2, indices_t, 1)
         
-        # 计算流畅性损失
+        # 计算流畅性损失，添加数值稳定性处理
         flu_loss = soft_nll(
-            top_k_filter_3d(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=x_mask, bad_mask=None),
-            y_logits_ / args.input_lgt_temp)
+            top_k_filter_3d(y_logits_t / args.output_lgt_temp + EPS, args.topk, extra_mask=x_mask, bad_mask=None),
+            y_logits_ / args.input_lgt_temp + EPS)
 
         # 计算xyz序列的logits
-        soft_forward_y_ = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
+        soft_forward_y_ = (y_logits_.detach() / TEMPERATURE - y_logits_).detach() + y_logits_
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
@@ -410,22 +432,33 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 
 
         #能量函数
-        # 计算目标损失
+        # 计算目标损失，添加数值稳定性处理
         c_loss_1 = torch.nn.CrossEntropyLoss(reduction='none')(
-            z_logits,
+            z_logits + EPS,
             z_t.view(-1))
         c_loss_1 = c_loss_1.view(args.batch_size, -1).mean(-1)
 
-        # 计算BLEU损失（用于避免生成不良词）
+        # 计算BLEU损失，添加数值稳定性处理
         c_loss_2 = batch_log_bleulosscnn_ae(
-            decoder_outputs=y_logits_.transpose(0, 1),
+            decoder_outputs=y_logits_.transpose(0, 1) + EPS,
             target_idx=bad_words_t,
             ngram_list=[1]
         )
+        #KL损失，添加数值稳定性处理
+        kl_loss = compute_kl_loss(y_logits_.detach() + EPS, y_logits_t + EPS)
+        kl_loss_weight = min(args.kl_max_weight, iter / args.num_iters)
+        # 组合总损失并添加损失项的尺度归一化
+        # 对各个损失项进行归一化处理
+        flu_loss_norm = flu_loss / (torch.abs(flu_loss.detach()) + EPS)
+        c_loss_1_norm = c_loss_1 / (torch.abs(c_loss_1.detach()) + EPS)
+        c_loss_2_norm = c_loss_2 / (torch.abs(c_loss_2.detach()) + EPS)
+        kl_loss_norm = kl_loss / (torch.abs(kl_loss.detach()) + EPS)
 
-
-        # 组合总损失
-        loss = args.goal_weight * c_loss_1 + 1 * flu_loss - args.rej_weight * c_loss_2
+        # 组合归一化后的损失
+        loss = (args.goal_weight * c_loss_1_norm + 
+                1 * flu_loss_norm - 
+                args.rej_weight * c_loss_2_norm + 
+                kl_loss_weight * kl_loss_norm)
         loss = loss.mean()
         # logger.info(f"  - Total Loss: {loss.item()}")
         
@@ -437,6 +470,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
                 'loss/fluency': flu_loss.mean().item(),
                 'loss/target': c_loss_1.mean().item(),
                 'loss/bleu': c_loss_2.mean().item(),
+                'loss/KL': kl_loss.mean().item(),
                 'norm/epsilon': torch.norm(epsilon).item(),
                 'norm/y_logits': torch.norm(y_logits).item(),
                 'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
