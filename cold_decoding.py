@@ -86,6 +86,7 @@ def options():
     # 代理模型地址
     parser.add_argument("--proxy_model", type=str, default="vicuna-7b-v1.5")
     parser.add_argument("--proxy_model_path", type=str)
+    parser.add_argument("--kl_max_weight", type=float, default=0.1)
 
     args = parser.parse_args()
     return args
