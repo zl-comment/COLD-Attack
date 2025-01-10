@@ -52,7 +52,7 @@ def setup_logger(args):
         encoding='utf-8',
         handlers=[
             logging.FileHandler(log_file,encoding = 'utf-8')
-           # logging.StreamHandler()  #同时输出到控制台
+            # logging.StreamHandler()  #同时输出到控制台
 
         ]
     )
@@ -128,7 +128,7 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
     #目标模型评估模式
     model.eval()
 
-    last_text_ids=filter_logits_for_target_model(last_text_ids,tokenizer.vocab_size, tokenizer.get_vocab())
+    last_text_ids=filter_logits_for_target_model(last_text_ids,len(tokenizer), tokenizer.get_vocab())
 
     text_post = text
     decoded_text = []
@@ -169,7 +169,6 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     '''
     x: left context   (prompt in lexical lexical task)
     z: optimization target  (original ending in counterfactual task)
-    #词法约束
     constraints: (constraint set in lexical constrained task)
     '''
     model.eval()   #设置评估模式
@@ -212,7 +211,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     lowercase_words = [word.upper() for word in words]
 
     bad_words = words + lowercase_words
-    
+
     bad_words = ' '.join(bad_words)
 
     BIG_CONST = 1e10
@@ -224,26 +223,17 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     x_t = torch.tensor(x_, device=device, dtype=torch.long)
     x_onehot = one_hot(x_t, dimension=len(tokenizer))
 
-    # if 'MindLLM-1b3' in args.proxy_model or 'gpt-j-6b' in args.proxy_model:    #填充零
-    #     x_onehot = F.pad(x_onehot, (0, model.get_input_embeddings().weight.size(0) - len(tokenizer)))
-
-
     # repeat batch_size times
     x_t = x_t.unsqueeze(0).repeat(args.batch_size, 1)
     x_onehot = x_onehot.repeat(args.batch_size, 1, 1)
-    # print(f"x_onehot shape: {x_onehot.shape if x_onehot is not None else None}")
 
     z_mask = None
     x_mask = None
     # extract keywords:
-    z_ = tokenizer.encode(z)[1:]  
+    z_ = tokenizer.encode(z)[1:]
     z_t = torch.tensor(z_, device=device, dtype=torch.long)
 
     z_onehot = one_hot(z_t, dimension=len(tokenizer))
-
-    # if 'MindLLM-1b3' in args.proxy_model or 'gpt-j-6b' in args.proxy_model:     #填充零
-    #     z_onehot = F.pad(z_onehot, (0, model.get_input_embeddings().weight.size(0) - len(tokenizer)))
-
     z_onehot = z_onehot.repeat(args.batch_size, 1, 1)
 
     z_t = z_t.unsqueeze(0).repeat(args.batch_size, 1)
@@ -254,20 +244,16 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     if args.verbose:
         logger.info("x:\t|%s|\nz:\t|%s|\nlength:\t%d\nconstraints:\t%s" % (
             tokenizer.decode(x_), tokenizer.decode(z_), length, constraints))
-    
+
     # z_mask: [batch_size, vocab_size]
-    z_words = word_tokenize(z[:])  
+    z_words = word_tokenize(z[:])
     z_nonstop_words = [w.lower() for w in z_words if w.lower() not in stop_words and w.isalnum()]
     z_nonstop_words += [z_words[0]]  # add the first token
     z_nonstop_words = ' ' + ' '.join(z_nonstop_words)
     z_nonstop_ = tokenizer.encode(z_nonstop_words)
     logger.info('|' + z_nonstop_words + '|')
 
-    if 'MindLLM-1b3'  in args.proxy_model:
-        z_mask = np.zeros([model.get_input_embeddings().weight.size(0)])
-    else:
-        z_mask = np.zeros([len(tokenizer)])
-
+    z_mask = np.zeros([len(tokenizer)])
     z_mask[z_nonstop_] = 1.
     z_mask = torch.tensor(z_mask, device=device)
     z_mask = z_mask.unsqueeze(0).unsqueeze(0).repeat(args.batch_size, length, 1)
@@ -279,15 +265,9 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
         length = x_t.shape[1] - length
 
     x_words = tokenizer.encode(bad_words)
-
-    if 'MindLLM-1b3' in args.proxy_model or 'gpt-j-6b' in args.proxy_model:
-        x_mask = np.zeros([model.get_input_embeddings().weight.size(0)])
-    else:
-        x_mask = np.zeros([len(tokenizer)])
-
+    x_mask = np.zeros([len(tokenizer)])
     x_mask[x_words] = 1.
     x_mask = torch.tensor(x_mask, device=device)
-
 
     bad_mask = x_mask.unsqueeze(0).unsqueeze(0).repeat(args.batch_size, length, 1)
 
@@ -302,13 +282,11 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     bad_words_t = bad_words_t.unsqueeze(0).repeat(args.batch_size, 1)
 
 
-
-    ##############################################################################################
+    ###################################################
 
     # 根据初始化模式选择初始logits
     if args.init_mode == 'original':
         # 使用模型初始化logits unitl中  x_t已经变成批次的输入了
-        # print(x_t)
         init_logits = initialize(model, x_t, length, args.init_temp, args.batch_size ,device, tokenizer)
     else:
         # 使用one-hot向量初始化logits
@@ -320,17 +298,17 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
                 [init_logits,
                  torch.zeros([args.batch_size, length - init_logits.shape[1], len(tokenizer)], device=device)],
                 dim=1)
-    
+
     # 从初始logits生成文本并打印 util.get_text_from_logits根据使用模型的tokenizer
     text, _, _ = get_text_from_logits(init_logits, tokenizer)
     for bi in range(args.batch_size):
         logger.info("[initial]: %s" % (text[bi]))
-    
+
     # 如果启用了wandb，初始化wandb项目
     if args.wandb:
         run_name = f"{args.mode}_{int(round(time.time() * 1000))}"
         wandb.init(
-            project='COLD-Attack',
+            project='COLD-Attack-proxy-KL-gpt-j',
             name=run_name,
             config=args,
             reinit=True)  # 确保每次都重新初始化
@@ -369,38 +347,34 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 
     mask_t = None
 
-    EPS = 1e-10
-    TEMPERATURE = 0.1
-
     # 主优化循环
     for iter in tqdm(range(args.num_iters), desc="Processing Goals"):
         # 你的逻辑代码
         print(f"Processing iteration {iter}")
         optim.zero_grad()  # 清除梯度
 
-        # 将扰动加到logits上，添加数值稳定性处理
-        y_logits_ = y_logits + epsilon + EPS
-        
-        # 使用更稳定的温度参数进行缩放
-        soft_forward_y = y_logits_ / TEMPERATURE  # 使用更稳定的温度值
-        
-        # 直通估计器处理
+        # 将扰动加到logits上
+        y_logits_ = y_logits + epsilon
+
+
+        soft_forward_y = y_logits_ / 0.001  # 温度缩放
+
+
+        # 直通估计器(Straight-through estimator)处理 为了前向传播
         if args.straight_through:
             if mask_t is None:
-                # 使用更稳定的温度参数
-                soft_forward_y = (y_logits_.detach() / TEMPERATURE - y_logits_).detach() + y_logits_
+                soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
             else:
-                # 使用更稳定的温度参数
-                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask, bad_mask=None) / TEMPERATURE
+                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask, bad_mask=None) / 0.001
 
-        # print(f"soft_forward_x shape: {soft_forward_x.shape if soft_forward_x is not None else None}")
+
         # 使用模型前向传播
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask, x_past=x_model_past, bad_mask=None)
         else:
             y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask, x_past=x_model_past, bad_mask=None)
-        
+
 
         # 生成top-k mask
         if args.topk == 0:
@@ -408,14 +382,14 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
         else:
             _, indices_t = torch.topk(y_logits_t, args.topk)
             mask_t = torch.zeros_like(y_logits_t).scatter_(2, indices_t, 1)
-        
-        # 计算流畅性损失，添加数值稳定性处理
+
+        # 计算流畅性损失
         flu_loss = soft_nll(
-            top_k_filter_3d(y_logits_t / args.output_lgt_temp + EPS, args.topk, extra_mask=x_mask, bad_mask=None),
-            y_logits_ / args.input_lgt_temp + EPS)
+            top_k_filter_3d(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=x_mask, bad_mask=None),
+            y_logits_ / args.input_lgt_temp)
 
         # 计算xyz序列的logits
-        soft_forward_y_ = (y_logits_.detach() / TEMPERATURE - y_logits_).detach() + y_logits_
+        soft_forward_y_ = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
@@ -430,38 +404,42 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
         xyz_logits = xyz_logits.view(-1, xyz_logits.shape[-1])
         z_logits = torch.cat([xyz_logits[bi * lg + st:bi * lg + ed, :] for bi in range(bz)], dim=0)
 
+        # print(f"z_logits shape: {z_logits.shape}")
+        # print(f"y_logits shape: {y_logits_.shape}")
 
-        #能量函数
-        # 计算目标损失，添加数值稳定性处理
+        # 计算目标损失
         c_loss_1 = torch.nn.CrossEntropyLoss(reduction='none')(
-            z_logits + EPS,
+            z_logits,
             z_t.view(-1))
         c_loss_1 = c_loss_1.view(args.batch_size, -1).mean(-1)
 
-        # 计算BLEU损失，添加数值稳定性处理
+        # 计算BLEU损失（用于避免生成不良词）
         c_loss_2 = batch_log_bleulosscnn_ae(
-            decoder_outputs=y_logits_.transpose(0, 1) + EPS,
+            decoder_outputs=y_logits_.transpose(0, 1),
             target_idx=bad_words_t,
             ngram_list=[1]
         )
-        #KL损失，添加数值稳定性处理
-        kl_loss = compute_kl_loss(y_logits_.detach() + EPS, y_logits_t + EPS)
-        kl_loss_weight = min(args.kl_max_weight, iter / args.num_iters)
-        # 组合总损失并添加损失项的尺度归一化
-        # 对各个损失项进行归一化处理
-        flu_loss_norm = flu_loss / (torch.abs(flu_loss.detach()) + EPS)
-        c_loss_1_norm = c_loss_1 / (torch.abs(c_loss_1.detach()) + EPS)
-        c_loss_2_norm = c_loss_2 / (torch.abs(c_loss_2.detach()) + EPS)
-        kl_loss_norm = kl_loss / (torch.abs(kl_loss.detach()) + EPS)
 
-        # 组合归一化后的损失
-        loss = (args.goal_weight * c_loss_1_norm + 
-                1 * flu_loss_norm - 
-                args.rej_weight * c_loss_2_norm + 
-                kl_loss_weight * kl_loss_norm)
+        # 重塑z_logits为三维张量 [batch_size, sequence_length, vocab_size]
+        z_logits = z_logits.view(bz, -1, z_logits.size(-1))
+
+        # 确保序列长度匹配
+        seq_len = min(z_logits.size(1), y_logits_.size(1))
+        z_logits = z_logits[:, :seq_len, :]
+        y_logits_reshaped = y_logits_[:, :seq_len, :]
+
+        # print(f"Reshaped z_logits: {z_logits.shape}")
+        # print(f"Reshaped y_logits: {y_logits_reshaped.shape}")
+
+        # 计算KL损失：z_logits作为目标分布(p)，y_logits_reshaped作为生成分布(q)
+        kl_closs = compute_kl_loss(z_logits, y_logits_reshaped, reduction="batchmean")
+        kl_loss_weight = min(args.kl_max_weight, iter / args.num_iters)
+
+        # 组合总损失
+        loss = args.goal_weight * c_loss_1 + 1 * flu_loss - args.rej_weight * c_loss_2+ kl_loss_weight * kl_closs
         loss = loss.mean()
         # logger.info(f"  - Total Loss: {loss.item()}")
-        
+
         if args.wandb:
             # 记录损失和范数到wandb
             wandb_step = iter + 1  # 使用1-based的step计数
@@ -470,25 +448,25 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
                 'loss/fluency': flu_loss.mean().item(),
                 'loss/target': c_loss_1.mean().item(),
                 'loss/bleu': c_loss_2.mean().item(),
-                'loss/KL': kl_loss.mean().item(),
+                'loss/KL': kl_closs.mean().item(),
                 'norm/epsilon': torch.norm(epsilon).item(),
                 'norm/y_logits': torch.norm(y_logits).item(),
                 'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
                 'norm/y_logits_t': torch.norm(y_logits_t).item(),
                 'learning_rate': scheduler.get_last_lr()[0]
             }, step=wandb_step)
-        
+
         # 如果不是最后一次迭代，进行反向传播和优化
-        if iter < args.num_iters - 1: 
+        if iter < args.num_iters - 1:
             loss.backward()
-            
+
             if args.wandb:
                 # 记录梯度到wandb，使用相同的step
                 wandb.log({
                     'grad/epsilon': torch.norm(epsilon.grad).item()
                 }, step=wandb_step)  # 使用相同的step
-            
-            # 记录梯度信息
+
+            # # 记录梯度信息
             # logger.info(f"\n[Iter {iter+1}] Gradient norms:")
             # logger.info(f"  - Epsilon grad norm: {torch.norm(epsilon.grad).item()}")   #计算梯度的L2范数
             
@@ -549,30 +527,3 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 
 
     return text, _, last_text_ids
-    # text_post = text
-    # decoded_text = []
-    # # 对每个batch生成完整文本
-    # for bi in range(args.batch_size):
-    #     prompt = x + " " + text_post[bi]
-    #     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    #     output_ids  = model.generate(inputs=input_ids, temperature=0.7, max_length = 512, pad_token_id=tokenizer.pad_token_id, do_sample=True, top_k=args.topk)
-    #     output_ids = output_ids[:, input_ids.shape[1]:]
-    #     text_dec = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    #     decoded_text.append(text_dec.strip())
-    
-    # # 计算最终的困惑度得分
-    # last_rank_loss = model(input_ids=last_text_ids, labels=last_text_ids).loss
-    # last_rank_loss = last_rank_loss.detach().clone().data.cpu().numpy()
-    # ppl_last = np.exp(last_rank_loss)  #这个是代表一个批次的平均困惑度
-    # ppl=[]
-    # for bi in range(args.batch_size):
-    #     ppl.append(ppl_last)
-    # # 组合最终的提示和生成文本
-    # prompt_with_adv = [x + " " + t for t in text_post]
-    
-    # # Clean up target model GPU memory
-    # del model
-    # del tokenizer
-    # torch.cuda.empty_cache()
-
-    # return ppl, text, text_post, decoded_text, prompt_with_adv
