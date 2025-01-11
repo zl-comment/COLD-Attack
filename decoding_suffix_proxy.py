@@ -128,7 +128,7 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
     #目标模型评估模式
     model.eval()
 
-    last_text_ids=filter_logits_for_target_model(last_text_ids,len(tokenizer), tokenizer.get_vocab())
+    last_text_ids=filter_logits_for_target_model(last_text_ids,tokenizer.vocab_size, tokenizer.get_vocab())
 
     text_post = text
     decoded_text = []
@@ -221,7 +221,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     else:
         x_ = tokenizer.encode(x)[1:]
     x_t = torch.tensor(x_, device=device, dtype=torch.long)
-    x_onehot = one_hot(x_t, dimension=len(tokenizer))
+    x_onehot = one_hot(x_t, dimension=tokenizer.vocab_size)
 
     # repeat batch_size times
     x_t = x_t.unsqueeze(0).repeat(args.batch_size, 1)
@@ -233,7 +233,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     z_ = tokenizer.encode(z)[1:]
     z_t = torch.tensor(z_, device=device, dtype=torch.long)
 
-    z_onehot = one_hot(z_t, dimension=len(tokenizer))
+    z_onehot = one_hot(z_t, dimension=tokenizer.vocab_size)
     z_onehot = z_onehot.repeat(args.batch_size, 1, 1)
 
     z_t = z_t.unsqueeze(0).repeat(args.batch_size, 1)
@@ -253,7 +253,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     z_nonstop_ = tokenizer.encode(z_nonstop_words)
     logger.info('|' + z_nonstop_words + '|')
 
-    z_mask = np.zeros([len(tokenizer)])
+    z_mask = np.zeros([tokenizer.vocab_size])
     z_mask[z_nonstop_] = 1.
     z_mask = torch.tensor(z_mask, device=device)
     z_mask = z_mask.unsqueeze(0).unsqueeze(0).repeat(args.batch_size, length, 1)
@@ -265,7 +265,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
         length = x_t.shape[1] - length
 
     x_words = tokenizer.encode(bad_words)
-    x_mask = np.zeros([len(tokenizer)])
+    x_mask = np.zeros([tokenizer.vocab_size])
     x_mask[x_words] = 1.
     x_mask = torch.tensor(x_mask, device=device)
 
@@ -276,7 +276,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     bad_words_ = tokenizer.encode(bad_words)[:]  # delete the "." token we appended before
     bad_words_t = torch.tensor(bad_words_, device=device, dtype=torch.long)
 
-    bad_words_onehot = one_hot(bad_words_t, dimension=len(tokenizer))
+    bad_words_onehot = one_hot(bad_words_t, dimension=tokenizer.vocab_size)
     bad_words_onehot = bad_words_onehot.repeat(args.batch_size, 1, 1)
 
     bad_words_t = bad_words_t.unsqueeze(0).repeat(args.batch_size, 1)
@@ -296,7 +296,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
         if length > init_logits.shape[1]:
             init_logits = torch.cat(
                 [init_logits,
-                 torch.zeros([args.batch_size, length - init_logits.shape[1], len(tokenizer)], device=device)],
+                 torch.zeros([args.batch_size, length - init_logits.shape[1], tokenizer.vocab_size], device=device)],
                 dim=1)
 
     # 从初始logits生成文本并打印 util.get_text_from_logits根据使用模型的tokenizer
@@ -308,7 +308,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     if args.wandb:
         run_name = f"{args.mode}_{int(round(time.time() * 1000))}"
         wandb.init(
-            project='COLD-Attack-proxy-KL-gpt-j',
+            project='COLD-Attack-proxy-final_model',
             name=run_name,
             config=args,
             reinit=True)  # 确保每次都重新初始化
@@ -467,8 +467,8 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
                 }, step=wandb_step)  # 使用相同的step
 
             # # 记录梯度信息
-            # logger.info(f"\n[Iter {iter+1}] Gradient norms:")
-            # logger.info(f"  - Epsilon grad norm: {torch.norm(epsilon.grad).item()}")   #计算梯度的L2范数
+            logger.info(f"\n[Iter {iter+1}] Gradient norms:")
+            logger.info(f"  - Epsilon grad norm: {torch.norm(epsilon.grad).item()}")   #计算梯度的L2范数
             
             optim.step()  #优化器更新
             scheduler.step()  #学习率调度
@@ -485,7 +485,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
                 input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
                 logger.info("\n Output of the model:\n")
                 output_ids  = model.generate(inputs=input_ids, temperature=0.7, max_length = 512, do_sample=True, top_k=args.topk)
-                
+                print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
                 logger.info(tokenizer.decode(output_ids[0], skip_special_tokens=True))
                 logger.info(
                     "%d, loss: %.4f,flu_loss: %.4f, c_loss_1: %.4f, c_loss_2: %.4f, lr: %.4f, |%s|" % (
