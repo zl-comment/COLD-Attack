@@ -15,15 +15,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from opt_util import load_model_and_tokenizer
 from util import *
-
-import time
-import seaborn as sns
-import copy
-
-from matplotlib import pyplot as plt
-import torch.nn.functional as F
-
-from tqdm import tqdm
 #新添加的import
 import torch
 from model.model_loader import load_proxy_model
@@ -113,7 +104,10 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
     proxy_model,proxy_tokenizer = load_proxy_model(args.proxy_model_path,  device=device)
     #加载代理模型系统提示词
     proxy_system_prompt="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed and polite answers to the user's questions."
-    text, _, last_text_ids=decode_proxy(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
+    if args.proxy_model == "Vicuna-7b-v1.5" or args.proxy_model == "Llama-3.2-3B":
+        text, _, last_text_ids=decode_proxy_little(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
+    else:
+        text, _, last_text_ids=decode_proxy(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
     
     # Clean up proxy model GPU memory
     del proxy_model
@@ -304,6 +298,19 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     for bi in range(args.batch_size):
         logger.info("[initial]: %s" % (text[bi]))
 
+    # Function to log gradients
+    def log_gradients(named_parameters):
+        for name, param in named_parameters:
+            if param.requires_grad and param.grad is not None:
+                logger.info(f"Gradient for {name}: {param.grad}")
+
+    # Add logging for logits
+    def log_logits(logits, step):
+        logger.info(f"Logits at step {step}: {logits}")
+
+    # Log initial logits
+    log_logits(init_logits, 'initial')
+
     # 如果启用了wandb，初始化wandb项目
     if args.wandb:
         run_name = f"{args.mode}_{int(round(time.time() * 1000))}"
@@ -470,6 +477,8 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
             logger.info(f"\n[Iter {iter+1}] Gradient norms:")
             logger.info(f"  - Epsilon grad norm: {torch.norm(epsilon.grad).item()}")   #计算梯度的L2范数
             
+            log_gradients(model.named_parameters())
+            
             optim.step()  #优化器更新
             scheduler.step()  #学习率调度
             last_lr = scheduler.get_last_lr()[0]
@@ -527,3 +536,144 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 
 
     return text, _, last_text_ids
+
+def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None, model_back=None, zz=None):
+    '''
+    x: left context   (prompt in lexical lexical task)
+    z: optimization target  (original ending in counterfactual task)
+    constraints: (constraint set in lexical constrained task)
+    '''
+    model.eval()   #设置评估模式
+    logger = setup_logger(args)
+
+    # 处理输入
+    if args.use_sysprompt:
+        x_sys = sys_prompt + x
+        x_ = tokenizer.encode(x_sys)[1:]
+    else:
+        x_ = tokenizer.encode(x)[1:]
+    x_t = torch.tensor(x_, device=device, dtype=torch.long)
+    x_onehot = one_hot(x_t, dimension=len(tokenizer)).float()
+    
+    # repeat batch_size times
+    x_t = x_t.unsqueeze(0).repeat(args.batch_size, 1)
+    x_onehot = x_onehot.repeat(args.batch_size, 1, 1)
+
+    # 获取模型的初始状态
+    model_outputs = model(x_t, use_cache=True)
+    x_model_past = model_outputs.past_key_values
+    init_logits = model_outputs.logits
+    
+    # 只使用最后一个token用于生成
+    soft_forward_x = x_onehot[:, -1:, :]
+
+    # 处理目标
+    z_ = tokenizer.encode(z)[1:]
+    z_t = torch.tensor(z_, device=device, dtype=torch.long)
+
+    # 确保序列长度匹配
+    seq_len = min(init_logits.size(1), len(z_))
+    init_logits = init_logits[:, :seq_len, :]
+    z_t = z_t[:seq_len]
+
+    # 创建one-hot编码并扩展batch维度
+    z_onehot = one_hot(z_t, dimension=len(tokenizer)).float()
+    z_onehot = z_onehot.repeat(args.batch_size, 1, 1)
+    z_t = z_t.unsqueeze(0).repeat(args.batch_size, 1)
+
+    # 打印维度信息
+    logger.info(f"init_logits shape: {init_logits.shape}")
+    logger.info(f"z_t shape: {z_t.shape}")
+    logger.info(f"z_onehot shape: {z_onehot.shape}")
+    logger.info(f"soft_forward_x shape: {soft_forward_x.shape}")
+    
+    # 创建优化的扰动参数epsilon
+    epsilon = torch.nn.Parameter(torch.zeros_like(init_logits))
+    optimizer = torch.optim.AdamW([epsilon], lr=args.stepsize)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, 
+                                              step_size=args.stepsize_iters,
+                                              gamma=args.stepsize_ratio)
+
+    # 定义损失函数
+    cross_entropy_loss = torch.nn.CrossEntropyLoss(reduction='none')
+    kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean')
+
+    # 生成初始文本
+    text, _, _ = decode_with_model_topk(
+        model, init_logits, args.topk, soft_forward_x, x_model_past, tokenizer,
+        extra_mask=None, bad_mask=None
+    )
+    for bi in range(args.batch_size):
+        logger.info(f"[initial]: {text[bi]}")
+
+    for iter in range(args.num_iters):
+        optimizer.zero_grad()
+
+        # Forward pass with past key values
+        current_logits = init_logits + epsilon
+        log_probs = torch.nn.functional.log_softmax(current_logits, dim=-1)
+        target_probs = torch.nn.functional.softmax(z_onehot, dim=-1)
+
+        # 打印维度信息
+        logger.info(f"current_logits shape: {current_logits.shape}")
+        logger.info(f"z_t shape: {z_t.shape}")
+        logger.info(f"current_logits view shape: {current_logits.view(-1, current_logits.size(-1)).shape}")
+        logger.info(f"z_t view shape: {z_t.view(-1).shape}")
+
+        # 确保维度匹配
+        seq_len = min(current_logits.size(1), z_t.size(1))
+        current_logits = current_logits[:, :seq_len, :]
+        z_t = z_t[:, :seq_len]
+
+        # 计算各种损失
+        ce_loss = cross_entropy_loss(
+            current_logits.view(-1, current_logits.size(-1)), 
+            z_t.view(-1)
+        ).view(args.batch_size, -1).mean(-1)
+        
+        kl_loss = kl_div_loss(log_probs, target_probs)
+        kl_loss_weight = min(args.kl_max_weight, iter / args.num_iters)
+
+        # 流畅性损失
+        flu_loss = soft_nll(
+            current_logits / args.output_lgt_temp,
+            soft_forward_x
+        )
+
+        # 组合损失
+        loss = args.goal_weight * ce_loss.mean() + kl_loss_weight * kl_loss + flu_loss.mean()
+        loss.backward()
+
+        # 梯度裁剪
+        torch.nn.utils.clip_grad_norm_([epsilon], max_norm=1.0)
+
+        # 记录梯度
+        logger.info(f"\n[Iter {iter+1}] Gradient norms:")
+        logger.info(f"  - Epsilon grad norm: {torch.norm(epsilon.grad).item()}")
+
+        # 更新参数
+        optimizer.step()
+        scheduler.step()
+
+        # 记录损失
+        logger.info(f"Iteration {iter+1}, Loss: {loss.item()}, "
+                   f"CE Loss: {ce_loss.mean().item()}, "
+                   f"KL Loss: {kl_loss.item()}, "
+                   f"Flu Loss: {flu_loss.mean().item()}")
+
+        # 定期生成文本
+        if args.verbose and ((iter + 1) % args.print_every == 0 or iter == 0 or iter + 1 == args.num_iters):
+            text, _, _ = decode_with_model_topk(
+                model, current_logits, args.topk, soft_forward_x, x_model_past, tokenizer,
+                extra_mask=None, bad_mask=None
+            )
+            for bi in range(args.batch_size):
+                logger.info(f"[iter {iter+1}]: {text[bi]}")
+
+    # 最终生成文本
+    text, logits_return, last_text_ids = decode_with_model_topk(
+        model, current_logits, args.topk, soft_forward_x, x_model_past, tokenizer,
+        extra_mask=None, bad_mask=None
+    )
+
+    return text, logits_return, last_text_ids
