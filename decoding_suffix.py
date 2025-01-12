@@ -277,7 +277,7 @@ def decode(model, tokenizer, device, x="", z="", constraints=None, args=None, sy
     if args.wandb:
         run_name = f"{args.mode}_{int(round(time.time() * 1000))}"
         wandb.init(
-            project='COLD-Attack',
+            project=args.wandb_project,
             name=run_name,
             config=args,
             reinit=True)  # 确保每次都重新初始化
