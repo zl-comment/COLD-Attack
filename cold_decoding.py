@@ -87,6 +87,7 @@ def options():
     parser.add_argument("--proxy_model", type=str, default="vicuna-7b-v1.5")
     parser.add_argument("--proxy_model_path", type=str)
     parser.add_argument("--kl_max_weight", type=float, default=0.1)
+    parser.add_argument("--wandb_project", type=str)
 
     args = parser.parse_args()
     return args
