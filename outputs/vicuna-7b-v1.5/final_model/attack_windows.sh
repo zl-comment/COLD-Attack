@@ -1,7 +1,7 @@
 python cold_decoding.py `
     --seed 12 `
     --mode "proxy" `
-    --pretrained_model "Llama-2-7b-chat-hf" `
+    --pretrained_model "Vicuna-7b-v1.5" `
     --init-temp 1 `
     --length 20 `
     --max-length 20 `
@@ -14,7 +14,7 @@ python cold_decoding.py `
     --noise-iters 1 `
     --win-anneal-iters 1000 `
     --start 0 `
-    --end 50 `
+    --end 0 `
     --lr-nll-portion 1.0 `
     --topk 10 `
     --output-lgt-temp 1 `
@@ -26,6 +26,7 @@ python cold_decoding.py `
     --batch-size 8 `
     --print-every 1000 `
     --fp16 `
-    --proxy_model "vicuna-7b-v1.5" `
-    --proxy_model_path "D:\ZLCODE\model\vicuna-7b-v1.5" `
+    --proxy_model "final_model" `
+    --proxy_model_path "D:\ZLCODE\BabyLlama\models\vicuna-7b-distilled\final_model" `
+    --wandb_project  'COLD-Attack-proxy-final_model' `
     --wandb
