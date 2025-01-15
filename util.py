@@ -68,8 +68,9 @@ def _greedy(logits):
 def top_k_filter_3d(logits, k, probs=False, mask=None, extra_mask=None, bad_mask=None):
     """
     logits.shape = [batch_size, length, vocab_size]
-    extra_mask: [batch_size, length, vocab_size], 1 if reserve
+    extra_mask:[batch_size, length, vocab_size], 1 if reserve
     """
+    # print("top_k_filter_3d: logits",logits)
     BIG_CONST = 1e10
     if k == 0:
         return logits
@@ -308,6 +309,7 @@ def soft_forward_loss(model, y_logits, topk, x_onehot, x_past, extra_mask=None, 
     # length = y_logits.shape[1]
     # for i in range(length):
     #     model_outputs = model(past_key_values=past, inputs_embeds=input_embeds) #送进去历史信息
+        
     #     past = model_outputs.past_key_values    
     #     logits_t = model_outputs.logits[:, -1:, :]  #选出来最后一个单词的logits
     #     assert logits_t.shape[1] == 1, logits_t.shape   
@@ -398,6 +400,8 @@ def sentence_completion(text_ids, model, max_length, device):
                 past = model_outputs.past_key_values
 
         model_outputs = model(past_key_values=past, inputs_embeds=last_embeds, use_cache=True)
+        past = model_outputs.past_key_values
+
         logits = model_outputs.logits
         past = model_outputs.past_key_values
 
@@ -421,10 +425,39 @@ def soft_distance(logits_perturbed, logits):
     return torch.nn.MSELoss()(logits_perturbed, logits)
 
 
-def soft_nll(logits_perturbed, logits):
+def soft_nll(logits_perturbed, logits, eps=1e-7):
+    """
+    计算软性负对数似然损失
+    Args:
+        logits_perturbed: 扰动后的logits
+        logits: 原始logits
+        eps: 数值稳定性参数
+    """
+    # # 打印输入形状和值的范围
+    # print(f"soft_nll input shapes:")
+    # print(f"logits_perturbed: {logits_perturbed.shape}, range: [{logits_perturbed.min()}, {logits_perturbed.max()}]")
+    # print(f"logits: {logits.shape}, range: [{logits.min()}, {logits.max()}]")
+    
+    # 对logits进行裁剪防止极端值
+    logits_perturbed = torch.clamp(logits_perturbed, -100, 100)
+    logits = torch.clamp(logits, -100, 100)
+    
+    # 计算softmax和log_softmax
     p = F.softmax(logits_perturbed, dim=-1)
+    p = torch.clamp(p, min=eps)
     logp = F.log_softmax(logits, dim=-1)
-    return -(p * logp).sum(dim=-1).mean(dim=-1)
+    
+    # 打印概率分布的范围
+    print(f"Probability ranges:")
+    print(f"p: [{p.min()}, {p.max()}]")
+    print(f"logp: [{logp.min()}, {logp.max()}]")
+    
+    loss = -(p * logp).sum(dim=-1).mean(dim=-1)
+    
+    # 打印损失值
+    print(f"Loss value: {loss.mean().item()}")
+    
+    return loss
 
 
 def soft_nll_detach(logits_perturbed, logits):
