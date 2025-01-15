@@ -7,9 +7,9 @@ python cold_decoding.py `
     --max-length 20 `
     --num-iters 2000 `
     --min-iters 0 `
-    --goal-weight 0.001 `
-    --rej-weight 0.001 `
-    --stepsize 1e-10 `
+    --goal-weight 100 `
+    --rej-weight 100 `
+    --stepsize 0.1 `
     --kl_max_weight 0.1 `
     --noise-iters 1 `
     --win-anneal-iters 1000 `
@@ -25,7 +25,8 @@ python cold_decoding.py `
     --stepsize-ratio 1 `
     --batch-size 8 `
     --print-every 1000 `
-    --proxy_model "Llama-3.2-3B" `
-    --proxy_model_path "D:\ZLCODE\model\Llama-3.2-3B" `
-    --wandb_project COLD_Attack_proxy_Llama-3.2-3B `
-     --wandb
+    --fp16 `
+    --proxy_model "final_model" `
+    --proxy_model_path "D:\ZLCODE\BabyLlama\models\vicuna-7b-distilled\final_model" `
+    --wandb_project COLD_Attack_proxy_final_model `
+    --wandb
