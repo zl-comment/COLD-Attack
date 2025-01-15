@@ -154,7 +154,7 @@ def run(args):
 
     # results.to_csv(f"outputs/{args.pretrained_model}/{args.start}_{args.end}_chosen.csv")
 
-    results = pd.read_csv(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv")
+    results = pd.read_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv")
 
     if args.defense_method == "none":
         ppls_adv = []
@@ -223,6 +223,7 @@ if __name__ == "__main__":
         description="Collect all attack results for a given model"
     )
     parser.add_argument("--pretrained-model", type=str, default="llama2")
+    parser.add_argument("--proxy_model", type=str)
     parser.add_argument("--start", type=int, default=1, help="loading data from ith examples.")
     parser.add_argument("--end", type=int, default=10, help="loading data util ith examples.")
     parser.add_argument("--defense-method", type=str, default="none")
