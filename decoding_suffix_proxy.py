@@ -13,7 +13,7 @@ from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 # from evaluation.bert_score import score
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from model.use_distilled_model import load_model
 from opt_util import load_model_and_tokenizer
 from util import *
 #新添加的import
@@ -132,10 +132,14 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
 
     
     #加载代理模型
-    proxy_model,proxy_tokenizer = load_proxy_model(args.proxy_model_path,  device=device)
+    if 'final_model' in args.proxy_model:
+        proxy_model,proxy_tokenizer = load_model(args.proxy_model_path)
+    else :
+        proxy_model,proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device)
+
     #加载代理模型系统提示词
     proxy_system_prompt="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed and polite answers to the user's questions."
-    if args.proxy_model == "Vicuna-7b-v1.5" or args.proxy_model == "Llama-3.2-3B" or args.proxy_model == "final_model":
+    if args.proxy_model == "Vicuna-7b-v1.5" or args.proxy_model == "Llama-3.2-3B" or args.proxy_model == "final_model-5":
         text, _, last_text_ids=decode_proxy_little(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
     else:
         text, _, last_text_ids=decode_proxy(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
@@ -145,7 +149,10 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
     del proxy_tokenizer
     
     torch.cuda.empty_cache()
-    
+
+    # 如果你希望等待 CUDA 操作完成，可以加入这行：
+    torch.cuda.synchronize()  # 等待所有 CUDA 操作完成
+
     model, tokenizer = load_model_and_tokenizer(model_path,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
@@ -154,30 +161,98 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
     model.eval()
 
     last_text_ids=filter_logits_for_target_model(last_text_ids,tokenizer.vocab_size, tokenizer.get_vocab())
+    print("text:",text)
 
     text_post = text
     decoded_text = []
     # 对每个batch生成完整文本
     for bi in range(args.batch_size):
-        prompt = x + " " + text_post[bi]
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-        output_ids  = model.generate(inputs=input_ids, temperature=0.7, max_length = 512, pad_token_id=tokenizer.pad_token_id, do_sample=True, top_k=args.topk)
-        output_ids = output_ids[:, input_ids.shape[1]:]
-        text_dec = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        decoded_text.append(text_dec.strip())
-
-    # print(last_text_ids)
+        print("\n=== 开始生成过程 ===")
+        print(f"批次大小: {args.batch_size}")
+        
+        # 检查text_post的有效性
+        if bi >= len(text_post):
+            print(f"警告: text_post索引{bi}超出范围(长度={len(text_post)})")
+            decoded_text.append("")
+            continue
+            
+        # 构建并验证prompt
+        try:
+            prompt = x + " " + text_post[bi]
+            print(f"原始prompt内容: {prompt[:100]}...")  # 只打印前100个字符
+            
+            # 验证prompt
+            if not prompt or prompt.isspace():
+                print(f"警告: 检测到空prompt,跳过生成")
+                decoded_text.append("")
+                continue
+                
+            # 清理特殊token
+            prompt = prompt.replace("</s>", " ").strip()  # 移除特殊token
+            
+            input = tokenizer(prompt, 
+                            return_tensors="pt",
+                            padding=True,
+                            truncation=True,
+                            max_length=512,
+                            return_attention_mask=True)
+            
+            # 移动到设备并验证
+            input_ids = input["input_ids"].to(device)
+            attention_mask = input["attention_mask"].to(device)
+            
+            print(f"tokenization后的input_ids形状: {input_ids.shape}")
+            print(f"前10个token: {input_ids[0,:10].tolist()}")
+            
+            # 验证input_ids
+            if input_ids.numel() == 0 or torch.all(input_ids == 0):
+                print(f"警告: 检测到无效的input_ids,跳过生成")
+                decoded_text.append("")
+                continue
+                
+            # 生成文本
+            try:
+                output_ids = model.generate(
+                    input_ids=input_ids,
+                    temperature=0.7,
+                    max_length=512,
+                    attention_mask=attention_mask,
+                    pad_token_id=tokenizer.pad_token_id,
+                    do_sample=True,
+                    top_k=args.topk
+                )
+                
+                output_ids = output_ids[:, input_ids.shape[1]:]
+                text_dec = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                decoded_text.append(text_dec.strip())
+                print(f"成功生成文本,长度: {len(text_dec)}")
+                
+            except RuntimeError as e:
+                print(f"生成过程中的CUDA错误: {str(e)}")
+                decoded_text.append("")
+            except Exception as e:
+                print(f"生成过程中的其他错误: {str(e)}")
+                decoded_text.append("")
+                
+        except Exception as e:
+            print(f"处理prompt时发生错误: {str(e)}")
+            decoded_text.append("")
+            continue
+    
+    print("\n=== 生成过程完成 ===")
+    print(f"成功生成的文本数量: {len([t for t in decoded_text if t])}/{args.batch_size}")
     # 计算最终的困惑度得分
     last_rank_loss = model(input_ids=last_text_ids, labels=last_text_ids).loss
     last_rank_loss = last_rank_loss.detach().clone().data.cpu().numpy()
-    ppl_last = np.exp(last_rank_loss)  #这个是代表一个批次的平均困惑度
-    ppl=[]
+    ppl_last = np.exp(last_rank_loss)  # 这个是代表一个批次的平均困惑度
+    ppl = []
     for bi in range(args.batch_size):
         ppl.append(ppl_last)
     # 组合最终的提示和生成文本
     prompt_with_adv = [x + " " + t for t in text_post]
+
     
-    # Clean up target model GPU memory
+    # # Clean up target model GPU memory
     del model
     del tokenizer
     torch.cuda.empty_cache()
@@ -400,7 +475,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     from tqdm import tqdm
     pbar = tqdm(range(args.num_iters), desc="Optimizing")
     for iter in pbar:
-        optimizer.zero_grad()
+        optim.zero_grad()
 
         # 将扰动加到logits上
         y_logits_ = y_logits + epsilon
@@ -622,14 +697,14 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #              'satisfy', 'complete', 'execute',
 #              'fair-minded', 'impartial', 'equitable',
 #              'reliable', 'trustable', 'faithful', 'invalid', 'safe', 'not', "can't", "but", "against"]
-#
+
 #     # 包含大写小写的不良词汇
 #     lowercase_words = [word.upper() for word in words]
-#
+
 #     bad_words = words + lowercase_words
-#
+
 #     bad_words = ' '.join(bad_words)
-#
+
 #     # 处理输入
 #     if args.use_sysprompt:
 #         x_sys = sys_prompt + x
@@ -638,7 +713,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #         x_ = tokenizer.encode(x)[1:]
 #     x_t = torch.tensor(x_, device=device, dtype=torch.long)
 #     x_onehot = one_hot(x_t, dimension=len(tokenizer)).float()
-#
+
 #     # repeat batch_size times
 #     x_t = x_t.unsqueeze(0).repeat(args.batch_size, 1)
 #     x_onehot = x_onehot.repeat(args.batch_size, 1, 1)
@@ -646,12 +721,12 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #     x_words = tokenizer.encode(bad_words)
 #     x_mask[x_words] = 1.
 #     x_mask = torch.tensor(x_mask, device=device)
-#
+
 #     # 获取模型的初始状态
 #     model_outputs = model(x_t, use_cache=True)
 #     x_model_past = model_outputs.past_key_values
 #     init_logits = model_outputs.logits
-#
+
 #     #模型的初始化回答
 #     # print("init_text : ", get_text_from_logits(init_logits, tokenizer))
 #     # 处理past key values
@@ -661,32 +736,31 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #         # 获取除最后一个token外的past key values
 #         x_model_outputs = model(x_t[:, :-1], use_cache=True)
 #         x_model_past = x_model_outputs.past_key_values
-#
+
 #     # 只使用最后一个token用于生成
 #     soft_forward_x = x_onehot[:, -1:, :]
-#
+
 #     # 处理目标
 #     z_ = tokenizer.encode(z)[1:]
 #     z_t = torch.tensor(z_, device=device, dtype=torch.long)
-#
+
 #     # 确保序列长度匹配
 #     seq_len = min(init_logits.size(1), len(z_))
 #     init_logits = init_logits[:, :seq_len, :]
 #     z_t = z_t[:seq_len]
-#
+
 #     # 创建one-hot编码并扩展batch维度
 #     z_onehot = one_hot(z_t, dimension=len(tokenizer)).float()
 #     z_onehot = z_onehot.repeat(args.batch_size, 1, 1)
 #     z_t = z_t.unsqueeze(0).repeat(args.batch_size, 1)
-#
+
 #     # 打印维度信息
 #     logger.info(f"init_logits shape: {init_logits.shape}")
 #     logger.info(f"z_t shape: {z_t.shape}")
 #     logger.info(f"z_onehot shape: {z_onehot.shape}")
 #     logger.info(f"soft_forward_x shape: {soft_forward_x.shape}")
-#
-#
-#
+
+
 #     # 创建优化的扰动参数epsilon
 #     epsilon = torch.nn.Parameter(torch.zeros_like(init_logits))
 #     optimizer = torch.optim.AdamW([epsilon], lr=args.stepsize)
@@ -695,8 +769,8 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #                                               gamma=args.stepsize_ratio)
 #     print('epsilon min/max:', epsilon.min(), epsilon.max())
 #     print('epsilon:', epsilon)
-#
-#
+
+
 #     # 如果启用了wandb，初始化wandb项目
 #     if args.wandb:
 #         run_name = f"{args.mode}_{int(round(time.time() * 1000))}"
@@ -705,9 +779,9 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #             name=run_name,
 #             config=args,
 #             reinit=True)  # 确保每次都重新初始化
-#
+
 #     mask_t = None
-#
+
 #     from tqdm import tqdm
 #     pbar = tqdm(range(args.num_iters), desc="Optimizing")
 #     for iter in pbar:
@@ -715,13 +789,14 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #         print('init_logits',init_logits)
 #         print('for epsilon min/max:', epsilon.min(), epsilon.max())
 #         print('for epsilon:', epsilon)
-#
+
 #         # 将扰动加到logits上
 #         y_logits_ = init_logits + epsilon
-#
+
+
 #         soft_forward_y = y_logits_ / 0.001  # 温度缩放
-#
-#
+
+
 #         # 直通估计器(Straight-through estimator)处理 为了前向传播
 #         if args.straight_through:
 #             if mask_t is None:
@@ -729,7 +804,8 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #             else:
 #                 soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask,
 #                                                  bad_mask=None) / 0.001
-#
+
+
 #         # 使用模型前向传播
 #         if args.fp16:
 #             with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -738,6 +814,8 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #         else:
 #             y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask,
 #                                       x_past=x_model_past, bad_mask=None)
+
+
 #         #
 #         # # Forward pass with past key values
 #         # y_logits_ = init_logits + epsilon
@@ -756,7 +834,8 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #             logger.info(f"\nForward pass shapes and values:")
 #             logger.info(f"y_logits_: {y_logits_.shape}, min: {y_logits_.min()}, max: {y_logits_.max()}")
 #             logger.info(f"y_logits_t: {y_logits_t.shape}, min: {y_logits_t.min()}, max: {y_logits_t.max()}")
-#
+
+
 #         # 计算损失，添加温度系数来平滑概率分布
 #         temperature = 1.0
 #         print("y_logits_ min/max:", y_logits_.min().item(), y_logits_.max().item())
@@ -766,29 +845,35 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #             print("\nGradient check before CE loss:")
 #             print(f"y_logits_ requires_grad: {y_logits_.requires_grad}")
 #             print(f"y_logits_ grad_fn: {y_logits_.grad_fn}")
-#
+
+
 #             # 打印输入张量的形状
 #             print("y_logits_ shape:", y_logits_.shape)
 #             print("z_t shape:", z_t.shape)
-#
+
+
 #             # 在计算 CE loss 之前对 logits 进行预处理
 #             y_logits__view = y_logits_.view(-1, y_logits_.size(-1))
 #             y_logits__view = torch.clamp(y_logits__view, min=-100.0, max=100.0)
 #             log_probs = F.log_softmax(y_logits__view / temperature, dim=-1)
-#
+
+
 #             # 打印预处理后的 logits 信息
 #             print("y_logits__view shape:", y_logits__view.shape)
 #             print("y_logits__view min/max:", log_probs.min().item(), log_probs.max().item())
-#
+
+
 #             # 处理目标 token IDs
 #             z_t_view = z_t.view(-1)
 #             print("z_t_view shape:", z_t_view.shape)
 #             print("z_t unique values:", z_t.unique())
-#
+
+
 #             # 使用 NLL loss 代替 cross entropy，因为我们已经计算了 log_softmax
 #             ce_loss = F.nll_loss(log_probs, z_t_view, reduction='none')
 #             ce_loss = ce_loss.view(args.batch_size, -1)
-#
+
+
 #             # 检查并处理潜在的无效值
 #             if torch.isnan(ce_loss).any() or torch.isinf(ce_loss).any():
 #                 logger.warning(f"Found invalid values in CE loss at iter {iter}")
@@ -797,124 +882,111 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #                     torch.tensor(10.0, device=device),
 #                     ce_loss
 #                 )
-#
+
+
 #             # 打印最终的 CE loss 信息
 #             print("Final ce_loss shape:", ce_loss.shape)
 #             print("Final ce_loss mean:", ce_loss.mean().item())
 #             logger.info(f"CE Loss shape: {ce_loss.shape}, value: {ce_loss.mean().item()}")
-#
+
+
 #         except Exception as e:
 #             # 捕获异常并记录错误信息
 #             logger.error(f"CE Loss error: {str(e)}")
 #             logger.error(f"Error traceback:", exc_info=True)
 #             ce_loss = torch.tensor(10.0, device=device)
-#             print("Final ce_loss shape (fallback):", ce_loss.shape)
+
+
 #         # 2. KL Loss
-#         # try:
-#         #     # 计算 y_logits_ 的概率分布
-#         #     y_logits__scaled = y_logits_ / temperature  # 使用当前的 logits
-#         #     current_probs = F.softmax(y_logits__scaled, dim=-1)
-#         #     current_probs = torch.clamp(current_probs, min=1e-10, max=1.0)
-#         #     log_current_probs = torch.log(current_probs)
-#         #
-#         #     # 使用 z_t 创建目标概率分布
-#         #     target_probs = torch.zeros_like(current_probs)
-#         #     batch_size, seq_len = z_t.shape
-#         #     vocab_size = current_probs.size(-1)
-#         #
-#         #     # 为每个位置创建正确的概率分布
-#         #     for b in range(batch_size):
-#         #         for s in range(seq_len):
-#         #             target_idx = z_t[b, s].item()  # 转换为 Python int
-#         #             # 使用标签平滑
-#         #             target_probs[b, s] = torch.full((vocab_size,), 0.0, device=device)
-#         #             target_probs[b, s, target_idx] = 1.0
-#         #
-#         #     # 应用标签平滑
-#         #     epsilon_smooth = 0.1
-#         #     target_probs = (1 - epsilon_smooth) * target_probs + epsilon_smooth / vocab_size
-#         #
-#         #     logger.info(f"\nKL Divergence detailed analysis at iter {iter}:")
-#         #     logger.info(f"Current probs - Range: [{current_probs.min().item()}, {current_probs.max().item()}]")
-#         #     logger.info(f"Target probs - Range: [{target_probs.min().item()}, {target_probs.max().item()}]")
-#         #     logger.info(f"Log probs - Range: [{log_current_probs.min().item()}, {log_current_probs.max().item()}]")
-#         #
-#         #     # 计算KL散度
-#         #     kl_loss = F.kl_div(
-#         #         log_current_probs.view(-1, y_logits_.size(-1)),
-#         #         target_probs.view(-1, y_logits_.size(-1)),
-#         #         reduction='batchmean',
-#         #         log_target=False
-#         #     )
-#         #
-#         #     # 检查并处理潜在的无效值
-#         #     if torch.isnan(kl_loss) or torch.isinf(kl_loss):
-#         #         logger.warning(f"Found invalid values in KL loss at iter {iter}")
-#         #         kl_loss = torch.tensor(10.0, device=device)
-#         #
-#         #     logger.info(f"KL Loss value: {kl_loss.item()}")
-#         #
-#         # except Exception as e:
-#         #     logger.error(f"KL Loss calculation error: {str(e)}")
-#         #     logger.error(f"Error traceback:", exc_info=True)
-#         #     kl_loss = torch.tensor(10.0, device=device)
-#         # try:
-#         #     # 确保 current_probs 的范围合法
-#         #     y_logits__scaled = y_logits_ / temperature
-#         #     current_probs = F.softmax(y_logits__scaled, dim=-1)
-#         #     current_probs = torch.clamp(current_probs, min=1e-7, max=1.0)  # 避免 0 和 1
-#         #
-#         #     log_current_probs = torch.log(current_probs)
-#         #
-#         #     # 确保 target_probs 的范围合法
-#         #     target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
-#         #     target_probs = torch.clamp(target_probs, min=1e-7, max=1.0)
-#         #
-#         #     # 计算 KL 散度
-#         #     kl_loss = F.kl_div(
-#         #         log_current_probs.view(-1, y_logits_.size(-1)),
-#         #         target_probs.view(-1, y_logits_.size(-1)),
-#         #         reduction='batchmean',
-#         #         log_target=False
-#         #     )
-#         #
-#         #     # 检查 KL Loss 的合法性
-#         #     if not torch.isfinite(kl_loss):
-#         #         logger.warning(f"Invalid KL Loss at iter {iter}: {kl_loss}")
-#         #         kl_loss = torch.tensor(10.0, device=device)
-#         #
-#         #     # 确保 KL Loss 有梯度
-#         #     if not kl_loss.requires_grad:
-#         #         kl_loss = kl_loss + epsilon.mean() * 0.0
-#         #
-#         # except Exception as e:
-#         #     logger.error(f"KL Loss calculation error: {str(e)}")
-#         #     logger.error(f"Error traceback:", exc_info=True)
-#         #     kl_loss = torch.tensor(10.0, device=device)
+#         try:
+#             # 计算 y_logits_ 的概率分布
+#             y_logits__scaled = y_logits_ / temperature  # 使用当前的 logits
+#             current_probs = F.softmax(y_logits__scaled, dim=-1)
+#             current_probs = torch.clamp(current_probs, min=1e-10, max=1.0)
+
+
+#             log_current_probs = torch.log(current_probs)
+
+
+#             # 使用 z_t 创建目标概率分布
+#             target_probs = torch.zeros_like(current_probs)
+#             batch_size, seq_len = z_t.shape
+#             vocab_size = current_probs.size(-1)
+
+
+#             # 为每个位置创建正确的概率分布
+#             for b in range(batch_size):
+#                 for s in range(seq_len):
+#                     target_idx = z_t[b, s].item()  # 转换为 Python int
+#                     # 使用标签平滑
+#                     target_probs[b, s] = torch.full((vocab_size,), 0.0, device=device)
+#                     target_probs[b, s, target_idx] = 1.0
+
+
+#             # 应用标签平滑
+#             epsilon_smooth = 0.1
+#             target_probs = (1 - epsilon_smooth) * target_probs + epsilon_smooth / vocab_size
+
+
+#             logger.info(f"\nKL Divergence detailed analysis at iter {iter}:")
+#             logger.info(f"Current probs - Range: [{current_probs.min().item()}, {current_probs.max().item()}]")
+#             logger.info(f"Target probs - Range: [{target_probs.min().item()}, {target_probs.max().item()}]")
+#             logger.info(f"Log probs - Range: [{log_current_probs.min().item()}, {log_current_probs.max().item()}]")
+
+
+#             # 计算KL散度
+#             kl_loss = F.kl_div(
+#                 log_current_probs.view(-1, y_logits_.size(-1)),
+#                 target_probs.view(-1, y_logits_.size(-1)),
+#                 reduction='batchmean',
+#                 log_target=False
+#             )
+
+
+#             # 检查并处理潜在的无效值
+#             if torch.isnan(kl_loss) or torch.isinf(kl_loss):
+#                 logger.warning(f"Found invalid values in KL loss at iter {iter}")
+#                 kl_loss = torch.tensor(10.0, device=device)
+
+
+#             logger.info(f"KL Loss value: {kl_loss.item()}")
+
+
+#         except Exception as e:
+#             logger.error(f"KL Loss calculation error: {str(e)}")
+#             logger.error(f"Error traceback:", exc_info=True)
+#             kl_loss = torch.tensor(10.0, device=device)
+
+
 #         # 3. Fluency Loss
 #         try:
 #             # 确保y_logits_t有梯度
 #             y_logits_t = y_logits_t + epsilon.mean() * 0.0  # 添加一个微小项来保持梯度流
-#
+
+
 #             # 将soft_forward_x转换为浮点数，并确保它有梯度
 #             soft_forward_x = F.one_hot(x_t[:, -1:], num_classes=len(tokenizer)).float()
 #             soft_forward_x = soft_forward_x + y_logits_t.mean() * 0.0  # 添加一个微小项来保持梯度流
-#
+
+
 #             flu_loss = soft_nll(
 #                 y_logits_t / args.output_lgt_temp,
 #                 soft_forward_x
 #             )
-#
+
+
 #             # print(f"\nFluency loss gradient check:")
 #             # print(f"y_logits_t requires_grad: {y_logits_t.requires_grad}")
 #             # print(f"soft_forward_x requires_grad: {soft_forward_x.requires_grad}")
 #             # print(f"flu_loss requires_grad: {flu_loss.requires_grad}")
-#
+
+
 #         except Exception as e:
 #             logger.error(f"Fluency Loss calculation error: {str(e)}")
 #             logger.error(f"Error traceback:", exc_info=True)
 #             flu_loss = torch.tensor(10.0, device=device).expand(batch_size, -1)
-#
+
+
 #         try:
 #             # 检查每个损失项的梯度状态
 #             print("\nFinal loss components gradient check:")
@@ -924,20 +996,24 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #             # print(f"kl_loss grad_fn: {kl_loss.grad_fn}")
 #             print(f"flu_loss requires_grad: {flu_loss.requires_grad}")
 #             print(f"flu_loss grad_fn: {flu_loss.grad_fn}")
-#
+
+
 #             # 确保每个损失项都有梯度
 #             if not ce_loss.requires_grad:
 #                 print("Warning: ce_loss missing gradient")
 #                 ce_loss = ce_loss + epsilon.mean() * 0.0
-#
+
+
 #             # if not kl_loss.requires_grad:
 #             #     print("Warning: kl_loss missing gradient")
 #             #     kl_loss = kl_loss + epsilon.mean() * 0.0
-#
+
+
 #             if not flu_loss.requires_grad:
 #                 print("Warning: flu_loss missing gradient")
 #                 flu_loss = flu_loss + epsilon.mean() * 0.0
-#
+
+
 #             # kl_loss_weight = min(args.kl_max_weight, iter / args.num_iters)
 #             # 计算最终损失
 #             loss = (
@@ -945,34 +1021,41 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #                     # kl_loss_weight * kl_loss +
 #                     flu_loss.mean()
 #             )
-#
+
+
 #             print("\nFinal combined loss check:")
 #             print(f"loss requires_grad: {loss.requires_grad}")
 #             print(f"loss grad_fn: {loss.grad_fn}")
-#
+
+
 #             # 如果最终损失没有梯度，添加一个微小项
 #             if not loss.requires_grad:
 #                 print("Warning: final loss missing gradient")
 #                 loss = loss + epsilon.mean() * 0.0
-#
+
+
 #             # 反向传播计算梯度
 #             loss.backward()
-#
-#
+
+
 #             # 梯度裁剪（可选）
 #             torch.nn.utils.clip_grad_norm_(epsilon, max_norm=1.0)
-#
+
+
 #             # 更新参数
 #             optimizer.step()
-#
+
+
 #             # 更新学习率
 #             scheduler.step()
-#
+
+
 #             # 检查 epsilon 的梯度
 #             for param in optimizer.param_groups[0]['params']:
 #                 print("Gradient:", param.grad)
 #                 assert torch.isfinite(param.grad).all(), "梯度包含 NaN 或 Inf"
-#
+
+
 #             # 打印调试信息
 #             logger.info("\n[Iter %d] Gradient norms:" % (iter + 1))
 #             if epsilon.grad is not None:
@@ -983,12 +1066,14 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #                 iter + 1, loss.item(), ce_loss.mean().item(), flu_loss.mean().item()
 #             ))
 #             print("Learning rate:", scheduler.get_last_lr())
-#
+
+
 #         except Exception as e:
 #             logger.error(f"Total loss calculation error: {str(e)}")
 #             logger.error(f"Error traceback:", exc_info=True)
 #             raise e
-#
+
+
 #         # 记录损失
 #         logger.info(f"Iteration {iter+1}, Loss: {loss.item()}, "
 #                    f"CE Loss: {ce_loss.mean().item()}, "
@@ -1004,7 +1089,8 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #                 # 'loss/KL': kl_loss.mean().item(),
 #                 'norm/epsilon': torch.norm(epsilon).item(),
 #             }, step=wandb_step)
-#
+
+
 #         # 定期生成文本
 #         if args.verbose and ((iter + 1) % args.print_every == 0 or iter == 0 or iter + 1 == args.num_iters):
 #             text, _, _ = decode_with_model_topk(
@@ -1013,13 +1099,13 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 #             )
 #             for bi in range(args.batch_size):
 #                 logger.info(f"[iter {iter+1}] {text[bi]}")
-#
+
 #     # 最终生成文本
 #     text, logits_return, last_text_ids = decode_with_model_topk(
 #         model, y_logits_, args.topk, soft_forward_x, x_model_past, tokenizer,
 #         extra_mask=None, bad_mask=None
 #     )
-#
+
 #     return text, logits_return, last_text_ids
 
 def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
@@ -1029,6 +1115,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     z: optimization target  (original ending in counterfactual task)
     constraints: (constraint set in lexical constrained task)
     '''
+    print("启动")
     model.eval()  # 设置评估模式
     # 设置日志记录器
     logger = setup_logger(args)
@@ -1346,7 +1433,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
 
         # 如果不是最后一次迭代，进行反向传播和优化
         if iter < args.num_iters - 1:
-            loss.backward()
+            loss.backward(retain_graph=True)
 
             if args.wandb:
                 # 记录梯度到wandb，使用相同的step
