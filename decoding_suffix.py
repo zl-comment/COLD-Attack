@@ -286,7 +286,7 @@ def decode(model, tokenizer, device, x="", z="", constraints=None, args=None, sy
     y_logits = init_logits
 
     # 创建优化的扰动参数epsilon
-    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits))  #创建一个于y_logits维度相同的参数全零张量
+    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32))  #创建一个于y_logits维度相同的参数全零张量
     if args.prefix_length > 0:
         pass
     else:
