@@ -13,7 +13,7 @@ python cold_decoding.py `
     --kl_max_weight 0.1 `
     --noise-iters 1 `
     --win-anneal-iters 1000 `
-    --start 0 `
+    --start 37 `
     --end 50 `
     --lr-nll-portion 1.0 `
     --topk 10 `
