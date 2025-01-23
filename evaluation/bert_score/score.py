@@ -36,7 +36,7 @@ def score(cands, refs, bert="bert-base-multilingual-cased",
     tokenizer = BertTokenizer.from_pretrained(BERT_BASE_UNCASED)
     model = BertModel.from_pretrained(BERT_BASE_UNCASED)
     model.eval()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda' #if torch.cuda.is_available() else 'cpu'
     model.to(device)
 
     # drop unused layers
