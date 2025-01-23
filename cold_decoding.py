@@ -100,7 +100,6 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-
 def main():
     args = options()
     # 设置 GPU 0
@@ -143,7 +142,7 @@ def main():
 
 
 
-   
+
     print(args.mode)
     if "suffix" in args.mode:
         from attack_suffix import attack_generation
