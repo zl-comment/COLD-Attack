@@ -168,13 +168,13 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
     # 对每个batch生成完整文本
     for bi in range(args.batch_size):
         print("\n=== 开始生成过程 ===")
-        print(f"批次大小: {args.batch_size}")
+        print(f"批次大小: {bi}")
         
-        # 检查text_post的有效性
-        if bi >= len(text_post):
-            print(f"警告: text_post索引{bi}超出范围(长度={len(text_post)})")
-            decoded_text.append("")
-            continue
+        # # 检查text_post的有效性
+        # if bi >= len(text_post):
+        #     print(f"警告: text_post索引{bi}超出范围(长度={len(text_post)})")
+        #     decoded_text.append("")
+        #     continue
             
         # 构建并验证prompt
         try:
