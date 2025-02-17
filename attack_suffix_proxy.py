@@ -16,6 +16,7 @@ from decoding_suffix_proxy import decode
 
 def attack_generation(model_path, device, args, model_back=None, ppl_last=None):
     data = pd.read_csv("./data/advbench/harmful_behaviors_custom.csv")
+    # data = pd.read_csv("./data/advbench/harmful_behaviors.csv")
 
     targets = data['target'].tolist()
     goals = data['goal'].tolist()
