@@ -139,7 +139,7 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
 
     #加载代理模型系统提示词
     proxy_system_prompt="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed and polite answers to the user's questions."
-    if args.proxy_model == "Vicuna-7b-v1.5" or args.proxy_model == "Llama-3.2-3B" or args.proxy_model == "final_model-5"or args.proxy_model == "final_model":
+    if args.proxy_model == "Vicuna-7b-v1.5" or args.proxy_model == "Llama-3.2-3B" or args.proxy_model == "final_model-10"or args.proxy_model == "final_model":
         text, _, last_text_ids=decode_proxy_little(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
     else:
         text, _, last_text_ids=decode_proxy(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
@@ -1411,7 +1411,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         rej_weight = args.rej_weight * (1 - iter / args.num_iters)
 
         # 组合总损失
-        loss = goal_weight * c_loss_1 + 1 * flu_loss - rej_weight * c_loss_2  #+ kl_loss_weight * kl_closs
+        loss = goal_weight * c_loss_1 + 1 * flu_loss - rej_weight * c_loss_2  + kl_loss_weight * kl_closs
         loss = loss.mean()
         # logger.info(f"  - Total Loss: {loss.item()}")
 
