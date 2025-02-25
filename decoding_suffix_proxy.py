@@ -18,6 +18,7 @@ from opt_util import load_model_and_tokenizer
 from util import *
 #新添加的import
 import torch
+from collections import defaultdict
 from model.model_loader import load_proxy_model
 stop_words = set(stopwords.words('english'))
 
@@ -750,10 +751,48 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     z: optimization target  (original ending in counterfactual task)
     constraints: (constraint set in lexical constrained task)
     '''
+
     print("启动")
     model.eval()  # 设置评估模式
     # 设置日志记录器
     logger = setup_logger(args)
+    
+    # 添加注意力分析函数
+    def get_attention_weights(outputs):
+        """提取注意力权重"""
+        attentions = outputs.attentions  # [num_layers, batch_size, num_heads, seq_len, seq_len]
+        if attentions is None:
+            return None
+        return torch.stack(attentions)
+
+    def analyze_attention_for_tokens(attention_weights, input_tokens, target_tokens):
+        """分析特定token的注意力分布"""
+        # attention_weights: [num_layers, batch_size, num_heads, seq_len, seq_len]
+        # 获取每个头的注意力得分
+        head_scores = defaultdict(float)
+        
+        for layer_idx in range(attention_weights.shape[0]):
+            for head_idx in range(attention_weights.shape[2]):
+                # 提取当前头的注意力权重
+                head_weights = attention_weights[layer_idx, 0, head_idx]  # [seq_len, seq_len]
+                
+                # 计算目标token的注意力得分
+                for target_idx in target_tokens:
+                    if target_idx < head_weights.shape[1]:
+                        score = head_weights[:, target_idx].mean().item()
+                        head_scores[f"layer_{layer_idx}_head_{head_idx}"] += score
+                        
+        return head_scores
+
+    # 创建注意力监控变量
+    attention_stats = {
+        'input_attention': defaultdict(list),
+        'bad_words_attention': defaultdict(list)
+    }
+    
+    # 存储每一步的注意力分数
+    previous_attention_scores = None
+    
     # 不良词汇
     words = ['sorry', 'apologetic', 'regretful',
              'unethical', 'immoral', 'dishonest',
@@ -787,7 +826,13 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
              'fair-minded', 'impartial', 'equitable',
              'reliable', 'trustable', 'faithful', 'invalid', 'safe', 'not', "can't", "but", "against"]
 
-    # 包含大写小写的不良词汇
+    # 预处理输入tokens和不良词tokens
+    input_tokens = tokenizer.encode(x)[1:]
+    bad_words_tokens = set()
+    for word in words:
+        bad_words_tokens.update(tokenizer.encode(word)[1:])
+    
+    #包含大写小写的不良词汇
     lowercase_words = [word.upper() for word in words]
 
     bad_words = words + lowercase_words
@@ -957,6 +1002,26 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
 
     from tqdm import tqdm
     scaler = torch.cuda.amp.GradScaler()
+    # 在优化循环前添加注意力分析
+    if args.wandb:
+        # 运行一次前向传播来获取注意力权重
+        with torch.no_grad():
+            outputs = model(x_t, output_attentions=True, use_cache=True)
+            attention_weights = get_attention_weights(outputs)
+            generation_attention_scores = analyze_generation_attention(outputs, tokenizer, bad_words_tokens)
+            if attention_weights is not None and generation_attention_scores is not None:
+                top_bad_word_heads = dict(sorted(generation_attention_scores.items(), 
+                                               key=lambda x: x[1], reverse=True)[:20])
+                wandb.log({
+                    'attention/bad_word_generation': wandb.plot.bar(
+                        wandb.Table(data=[[k, v] for k, v in top_bad_word_heads.items()],
+                                  columns=["attention_head", "bad_word_score"]),
+                        "attention_head",
+                        "bad_word_score",
+                        title="Top 20 Attention Heads Contributing to Bad Word Generation"
+                    )
+                }, step=0)  # 使用step=0表示这是初始分析
+                
     pbar = tqdm(range(args.num_iters), desc="Optimizing")
     for iter in pbar:
         optim.zero_grad()
@@ -976,8 +1041,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         # 使用模型前向传播
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask,
-                                          x_past=x_model_past, bad_mask=None)
+                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask, x_past=x_model_past, bad_mask=None)
         else:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask,
@@ -1091,6 +1155,79 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         if args.wandb:
             # 记录损失和范数到wandb
             wandb_step = iter + 1  # 使用1-based的step计数
+            
+            # 分析当前步骤的注意力分布
+            if iter % 100 == 0:  # 每100步记录一次，避免记录太频繁
+                with torch.no_grad():
+                    # 获取当前的注意力权重
+                    current_outputs = model(x_t, output_attentions=True, use_cache=True)
+                    current_attention_weights = get_attention_weights(current_outputs)
+                    
+                    if current_attention_weights is not None:
+                        # 分析输入tokens的注意力
+                        input_attention_scores = analyze_attention_for_tokens(
+                            current_attention_weights,
+                            input_tokens,
+                            range(len(input_tokens))
+                        )
+                        
+                        # 分析不良词汇的注意力
+                        bad_words_attention_scores = analyze_attention_for_tokens(
+                            current_attention_weights,
+                            input_tokens,
+                            bad_words_tokens
+                        )
+                        
+                        # 获取top 20的注意力头
+                        current_top_input_heads = dict(sorted(input_attention_scores.items(), 
+                                                    key=lambda x: x[1], reverse=True)[:20])
+                        current_top_bad_words_heads = dict(sorted(bad_words_attention_scores.items(), 
+                                                        key=lambda x: x[1], reverse=True)[:20])
+                        
+                        # 计算注意力变化
+                        attention_changes = {}
+                        if previous_attention_scores is not None:
+                            for head in set(current_top_input_heads.keys()) | set(previous_attention_scores.keys()):
+                                old_score = previous_attention_scores.get(head, 0)
+                                new_score = current_top_input_heads.get(head, 0)
+                                attention_changes[head] = new_score - old_score
+                        
+                        # 更新previous_attention_scores为当前值
+                        previous_attention_scores = current_top_input_heads.copy()
+                        
+                        # 使用单独的wandb.log调用记录注意力数据
+                        attention_step = (iter // 100) * 100  # 使用整百的步数作为attention记录的步数
+                        wandb.log({
+                            'attention/current_input_tokens': wandb.plot.bar(
+                                wandb.Table(data=[[k, v] for k, v in current_top_input_heads.items()],
+                                          columns=["attention_head", "score"]),
+                                "attention_head",
+                                "score",
+                                title="Top 20 Attention Heads for Input Tokens"
+                            ),
+                            'attention/current_bad_words': wandb.plot.bar(
+                                wandb.Table(data=[[k, v] for k, v in current_top_bad_words_heads.items()],
+                                          columns=["attention_head", "score"]),
+                                "attention_head",
+                                "score",
+                                title="Top 20 Attention Heads for Bad Words"
+                            )
+                        }, step=attention_step)
+                        
+                        # 只有当有变化时才记录变化图
+                        if attention_changes:
+                            wandb.log({
+                                'attention/changes': wandb.plot.bar(
+                                    wandb.Table(data=[[k, v] for k, v in sorted(attention_changes.items(), 
+                                                                              key=lambda x: abs(x[1]), 
+                                                                              reverse=True)[:20]],
+                                              columns=["attention_head", "score_change"]),
+                                    "attention_head",
+                                    "score_change",
+                                    title="Top 20 Attention Head Changes"
+                                )
+                            }, step=attention_step)
+            
             wandb.log({
                 'loss/total': loss.item(),
                 'loss/fluency': flu_loss.mean().item(),
@@ -1187,3 +1324,28 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         model, y_logits_, args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None, bad_mask=None)
 
     return text, _, last_text_ids
+
+def analyze_generation_attention(model_output, tokenizer, bad_words_tokens):
+    """分析生成过程中的注意力，特别关注生成不良词时的注意力分布"""
+    attentions = model_output.attentions  # 获取所有层的注意力
+    if attentions is None:
+        return None
+        
+    # 获取生成的token
+    generated_tokens = model_output.logits.argmax(dim=-1)
+    
+    # 创建一个字典来存储每个注意力头生成不良词的次数
+    bad_word_generation_counts = defaultdict(int)
+    
+    # 遍历每个生成的token
+    for pos in range(generated_tokens.shape[1]):
+        token = generated_tokens[0, pos].item()
+        if token in bad_words_tokens:
+            # 这个位置生成了不良词，分析是哪些注意力头的贡献最大
+            for layer_idx, layer_attention in enumerate(attentions):
+                # layer_attention shape: [batch_size, num_heads, seq_len, seq_len]
+                for head_idx in range(layer_attention.shape[1]):
+                    # 获取这个头在生成这个token时的注意力权重
+                    attention_score = layer_attention[0, head_idx, pos].mean().item()
+                    bad_word_generation_counts[f"layer_{layer_idx}_head_{head_idx}"] += attention_score
+    return bad_word_generation_counts
