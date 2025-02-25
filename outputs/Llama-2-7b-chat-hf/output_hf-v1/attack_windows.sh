@@ -9,11 +9,11 @@ python cold_decoding.py `
   --goal-weight 100 `
   --rej-weight 100 `
   --stepsize 1e-10 `
-  --kl_max_weight 0.1 `
+  --kl_max_weight 5.0 `
   --noise-iters 1 `
   --win-anneal-iters 1000 `
-  --start 19 `
-  --end 50 `
+  --start 0 `
+  --end 0 `
   --lr-nll-portion 1.0 `
   --topk 10 `
   --output-lgt-temp 1 `
@@ -25,7 +25,7 @@ python cold_decoding.py `
   --batch-size 8 `
   --print-every 1000 `
   --fp16 `
-  --proxy_model "final_model-10" `
-  --proxy_model_path "D:\ZLCODE\BabyLlama\models\vicuna-7b-distilled\final_model-10" `
-  --wandb_project COLD_Attack_proxy_final_model-10_1e-10 `
+  --proxy_model "output_hf-v1" `
+  --proxy_model_path "D:\ZLCODE\LoRAPrune\output_hf-v1" `
+  --wandb_project COLD_Attack_proxy_output_hf-v1_1e-10_KL_5 `
   --wandb

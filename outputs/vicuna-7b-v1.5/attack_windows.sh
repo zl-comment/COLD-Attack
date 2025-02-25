@@ -9,7 +9,7 @@ python cold_decoding.py `
     --min-iters 0 `
     --goal-weight 100 `
     --rej-weight 100 `
-    --stepsize 0.1 `
+    --stepsize 1e-10 `
     --noise-iters 1 `
     --win-anneal-iters 1000 `
     --start 0 `
@@ -25,5 +25,5 @@ python cold_decoding.py `
     --batch-size 8 `
     --print-every 1000 `
     --fp16 `
-    --wandb_project COLD_Attack_V `
+    --wandb_project COLD_Attack_vicuna `
     --wandb
