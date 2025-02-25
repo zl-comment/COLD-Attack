@@ -121,7 +121,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
     model_path_dicts = {"Llama-2-7b-chat-hf": "D:\ZLCODE\model\Llama-2-7b-chat-hf",
                         "Vicuna-7b-v1.5": "D:\ZLCODE\model\\"+"vicuna-7b-v1.5",
-                        "guanaco-7b": "TheBloke/guanaco-7B-HF",
+                        "guanaco-7b": "D:\ZLCODE\model\guanaco-7B-HF",
                         "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.2", 
                         }
     model_path = model_path_dicts[args.pretrained_model]
