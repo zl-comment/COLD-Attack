@@ -21,6 +21,48 @@ import torch
 from model.model_loader import load_proxy_model
 stop_words = set(stopwords.words('english'))
 
+proxy_models_little = ["Vicuna-7b-v1.5", "Llama-3.2-3B", "final_model-10", "final_model","output_hf-v1"]
+
+# 计算KL损失：z_logits作为目标分布(p)，y_logits_reshaped作为生成分布(q)
+def compute_stable_kl_loss(p_logits, q_logits, eps=1e-8):
+            # 预处理logits以提高数值稳定性
+            p_mean = p_logits.mean(dim=-1, keepdim=True)
+            q_mean = q_logits.mean(dim=-1, keepdim=True)
+            p_std = p_logits.std(dim=-1, keepdim=True) + eps
+            q_std = q_logits.std(dim=-1, keepdim=True) + eps
+            
+            p_logits = (p_logits - p_mean) / p_std
+            q_logits = (q_logits - q_mean) / q_std
+            
+            # 使用温度参数计算概率分布
+            p = F.softmax(p_logits / 2.0, dim=-1)
+            q = F.softmax(q_logits / 2.0, dim=-1)
+            
+            # 确保数值稳定性
+            p = torch.clamp(p, min=eps, max=1.0)
+            q = torch.clamp(q, min=eps, max=1.0)
+            
+            # 计算每个位置的KL散度
+            kl = F.kl_div(q.log(), p, reduction='none')
+            
+            # 对词表维度求和，保持batch和序列维度
+            kl = kl.sum(dim=-1)
+            
+            # 应用Huber loss来平滑极端值
+            delta = 1.0
+            kl = torch.where(kl < delta,
+                           0.5 * kl * kl,
+                           delta * (kl - 0.5 * delta))
+            
+            # 计算最终的loss
+            return kl.mean() * (2.0 ** 2)
+        
+def preprocess_logits(logits, eps=1e-6):
+            # 对logits进行缩放，避免极值
+            mean = logits.mean(dim=-1, keepdim=True)
+            std = logits.std(dim=-1, keepdim=True) + eps
+            logits = (logits - mean) / std
+            return logits
 
 # 设置日志记录器
 def setup_logger(args):
@@ -139,7 +181,8 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
 
     #加载代理模型系统提示词
     proxy_system_prompt="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed and polite answers to the user's questions."
-    if args.proxy_model == "Vicuna-7b-v1.5" or args.proxy_model == "Llama-3.2-3B" or args.proxy_model == "final_model-10"or args.proxy_model == "final_model":
+    
+    if args.proxy_model in proxy_models_little:
         text, _, last_text_ids=decode_proxy_little(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
     else:
         text, _, last_text_ids=decode_proxy(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
@@ -434,11 +477,25 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
     if args.prefix_length > 0:
         pass
     else:
-        # 创建Adam优化器
-        optim = torch.optim.Adam([epsilon], lr=args.stepsize) #学习率优化器
+        # 创建优化器，使用较小的学习率和适度的正则化
+        optim = torch.optim.AdamW(
+            [epsilon], 
+            lr=args.stepsize * 0.1,  # 保持适中的学习率
+            weight_decay=0.0001,     # 减小weight decay
+            betas=(0.9, 0.999),      # 标准的动量参数
+            eps=1e-8
+        )
+    
     # 创建学习率调度器
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optim, step_size=args.stepsize_iters,
-                                                gamma=args.stepsize_ratio) #学习率调度器
+    def warmup_cosine_schedule(step):
+        warmup_steps = args.num_iters // 10
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            progress = (step - warmup_steps) / (args.num_iters - warmup_steps)
+            return 0.5 * (1 + np.cos(np.pi * progress))
+            
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_cosine_schedule)
 
     frozen_len = args.frozen_length  #冻结的长度
 
@@ -460,17 +517,17 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
 
     mask_t = None
 
-    # # 计算三个损失
-    # try:
-    #     # 准备优化器和调度器
-    #     optimizer = torch.optim.Adam([epsilon], lr=args.stepsize)
-    #     scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
-    #                                           step_size=args.stepsize_iters,
-    #                                           gamma=args.stepsize_ratio)
-    # except Exception as e:
-    #     print(f"Error in initialization: {str(e)}")
-    #     print(f"Error traceback: {traceback.format_exc()}")
-    #     raise e
+    # 计算三个损失
+    try:
+        # 准备优化器和调度器
+        optimizer = torch.optim.Adam([epsilon], lr=args.stepsize)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
+                                              step_size=args.stepsize_iters,
+                                              gamma=args.stepsize_ratio)
+    except Exception as e:
+        print(f"Error in initialization: {str(e)}")
+        print(f"Error traceback: {traceback.format_exc()}")
+        raise e
 
     from tqdm import tqdm
     pbar = tqdm(range(args.num_iters), desc="Optimizing")
@@ -555,24 +612,55 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
         # print(f"Reshaped z_logits: {z_logits.shape}")
         # print(f"Reshaped y_logits: {y_logits_reshaped.shape}")
 
-        # 计算KL损失：z_logits作为目标分布(p)，y_logits_reshaped作为生成分布(q)
-        kl_closs = compute_kl_loss(z_logits, y_logits_reshaped, reduction="batchmean")
-        kl_loss_weight = min(args.kl_max_weight, iter / args.num_iters)
+        
 
-        # 组合总损失
-        loss = args.goal_weight * c_loss_1 + 1 * flu_loss - args.rej_weight * c_loss_2+ kl_loss_weight * kl_closs
+        z_logits = preprocess_logits(z_logits)
+        y_logits_reshaped = preprocess_logits(y_logits_reshaped)
+
+        kl_loss = compute_stable_kl_loss(z_logits, y_logits_reshaped)
+        
+        # 检查并处理NaN
+        if torch.isnan(kl_loss):
+            print("Warning: KL loss is NaN, resetting to zero")
+            kl_loss = torch.zeros_like(kl_loss)
+        
+        # 使用更保守的权重
+        progress = iter / args.num_iters
+        kl_loss_weight = args.kl_max_weight * 0.5  # 固定较小的KL权重
+        
+        # 其他权重保持稳定
+        goal_weight = args.goal_weight  # 保持原始权重
+        rej_weight = args.rej_weight    # 保持原始权重
+        flu_weight = 0.5                # 保持固定值
+        
+        # 计算总loss
+        loss = (
+            goal_weight * c_loss_1 + 
+            flu_weight * flu_loss - 
+            rej_weight * c_loss_2 + 
+            kl_loss_weight * kl_loss
+        )
         loss = loss.mean()
-        # logger.info(f"  - Total Loss: {loss.item()}")
+
+        # 记录当前loss和权重
+        if iter % 100 == 0:
+            print(f"Step {iter}, Total Loss: {loss.item():.4f}, KL Loss: {kl_loss.item():.4f}")
+            print(f"Weights - Goal: {goal_weight:.3f}, KL: {kl_loss_weight:.3f}, Rej: {rej_weight:.3f}")
 
         if args.wandb:
-            # 记录损失和范数到wandb
-            wandb_step = iter + 1  # 使用1-based的step计数
+            wandb_step = iter + 1
             wandb.log({
                 'loss/total': loss.item(),
                 'loss/fluency': flu_loss.mean().item(),
                 'loss/target': c_loss_1.mean().item(),
                 'loss/bleu': c_loss_2.mean().item(),
-                'loss/KL': kl_closs.mean().item(),
+                'loss/KL': kl_loss.mean().item(),
+                'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
+                'progress': progress,
+                'weights/goal': goal_weight,
+                'weights/fluency': flu_weight,
+                'weights/rejection': rej_weight,
+                'weights/kl': kl_loss_weight,
                 'norm/epsilon': torch.norm(epsilon).item(),
                 'norm/y_logits': torch.norm(y_logits).item(),
                 'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
@@ -580,30 +668,28 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
                 'learning_rate': scheduler.get_last_lr()[0]
             }, step=wandb_step)
 
-        # 如果不是最后一次迭代，进行反向传播和优化
-        if iter < args.num_iters - 1:
-            loss.backward()
-
-            if args.wandb:
-                # 记录梯度到wandb，使用相同的step
-                wandb.log({
-                    'grad/epsilon': torch.norm(epsilon.grad).item()
-                }, step=wandb_step)  # 使用相同的step
-
-            # # 记录梯度信息
-            logger.info(f"\n[Iter {iter+1}] Gradient norms:")
             if epsilon.grad is not None:
-                logger.info("  - Epsilon grad norm: %.1f" % torch.norm(epsilon.grad).item())
-            else:
-                logger.info("  - Epsilon grad is None")
-            
-            log_gradients(model.named_parameters())
-            
-            optim.step()  #优化器更新
-            scheduler.step()  #学习率调度
-            last_lr = scheduler.get_last_lr()[0]
-            # logger.info(f"[Iter {iter+1}] Learning rate: {last_lr}")
-            
+                wandb.log({
+                    'grad/epsilon': torch.norm(epsilon.grad).item(),
+                    'grad/max': epsilon.grad.max().item(),
+                    'grad/min': epsilon.grad.min().item()
+                }, step=wandb_step)
+
+        # 反向传播
+        loss.backward()
+        
+        # 应用梯度裁剪
+        max_grad_norm = 1.0  # 使用更大的阈值
+        torch.nn.utils.clip_grad_norm_([epsilon], max_grad_norm)
+        
+        # 优化器步进
+        optim.step()
+        scheduler.step()
+        
+        # 添加正则化项
+        l2_reg = torch.norm(epsilon) * 0.01
+        loss += l2_reg
+
         # 定期打印生成结果
         if args.verbose and ((iter + 1) % args.print_every == 0 or iter == 0 or iter + 1 == args.num_iters):
             text, _, last_text_ids = decode_with_model_topk(
@@ -618,7 +704,7 @@ def decode_proxy(model, tokenizer, device, x="", z="", constraints=None, args=No
                 logger.info(tokenizer.decode(output_ids[0], skip_special_tokens=True))
                 logger.info(
                     "%d, loss: %.4f,flu_loss: %.4f, c_loss_1: %.4f, c_loss_2: %.4f, lr: %.4f, |%s|" % (
-                        iter + 1, loss.item(), flu_loss[bi].item(), c_loss_1[bi].item(), c_loss_2[bi].item(), last_lr, text_post[bi]))
+                        iter + 1, loss.item(), flu_loss[bi].item(), c_loss_1[bi].item(), c_loss_2[bi].item(), scheduler.get_last_lr()[0], text_post[bi]))
                         
         # 添加噪声以增加多样性
         if iter < args.num_iters - 1:
@@ -775,6 +861,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
 
     bad_words_t = bad_words_t.unsqueeze(0).repeat(args.batch_size, 1)
 
+
     ###################################################
 
     # 根据初始化模式选择初始logits
@@ -828,11 +915,25 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     if args.prefix_length > 0:
         pass
     else:
-        # 创建Adam优化器
-        optim = torch.optim.Adam([epsilon], lr=args.stepsize)  # 学习率优化器
-    # 创建学习率调度器
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optim, step_size=args.stepsize_iters,
-                                                gamma=args.stepsize_ratio)  # 学习率调度器
+        # 创建优化器，使用较小的学习率和适度的正则化
+        optim = torch.optim.AdamW(
+            [epsilon], 
+            lr=args.stepsize * 0.008,
+            weight_decay=0.0005, 
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+    
+    # 创建学习率调度器，使用更平缓的衰减
+    def warmup_linear_schedule(step):
+        warmup_steps = args.num_iters // 15  # 5%的步数用于warmup
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            # 线性衰减，最低到初始学习率的10%
+            return max(0.2, 1.0 - 0.8 * (step - warmup_steps) / (args.num_iters - warmup_steps))
+            
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_linear_schedule)
 
     frozen_len = args.frozen_length  # 冻结的长度
 
@@ -854,28 +955,15 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
 
     mask_t = None
 
-    # # 计算三个损失
-    # try:
-    #     # 准备优化器和调度器
-    #     optimizer = torch.optim.Adam([epsilon], lr=args.stepsize)
-    #     scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
-    #                                                 step_size=args.stepsize_iters,
-    #                                                 gamma=args.stepsize_ratio)
-    # except Exception as e:
-    #     print(f"Error in initialization: {str(e)}")
-    #     print(f"Error traceback: {traceback.format_exc()}")
-    #     raise e
-
     from tqdm import tqdm
     scaler = torch.cuda.amp.GradScaler()
     pbar = tqdm(range(args.num_iters), desc="Optimizing")
     for iter in pbar:
         optim.zero_grad()
-        # print("y_logits:",y_logits)
 
         # 将扰动加到logits上
         y_logits_ = y_logits + epsilon
-        # print("y_logits_:",y_logits_)
+
         soft_forward_y = y_logits_ / 0.001  # 温度缩放
 
         # 直通估计器(Straight-through estimator)处理 为了前向传播
@@ -883,8 +971,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
             if mask_t is None:
                 soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
             else:
-                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask,
-                                                 bad_mask=None) / 0.001
+                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask, bad_mask=None) / 0.001
 
         # 使用模型前向传播
         if args.fp16:
@@ -902,7 +989,6 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         else:
             _, indices_t = torch.topk(y_logits_t, args.topk)
             mask_t = torch.zeros_like(y_logits_t).scatter_(2, indices_t, 1)
-
 
         flu_loss = soft_nll(
             top_k_filter_3d(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=x_mask, bad_mask=None),
@@ -949,20 +1035,58 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         z_logits = z_logits[:, :seq_len, :]
         y_logits_reshaped = y_logits_[:, :seq_len, :]
 
-        # print(f"Reshaped z_logits: {z_logits.shape}")
-        # print(f"Reshaped y_logits: {y_logits_reshaped.shape}")
+        print(f"Reshaped z_logits: {z_logits.shape}")
+        print(f"Reshaped y_logits: {y_logits_reshaped.shape}")
 
-        # 计算KL损失：z_logits作为目标分布(p)，y_logits_reshaped作为生成分布(q)
-        kl_closs = compute_kl_loss(z_logits, y_logits_reshaped, reduction="batchmean")
-        kl_loss_weight = min(args.kl_max_weight, iter / args.num_iters)
+        
 
-        goal_weight = args.goal_weight * (1 + iter / args.num_iters)
-        rej_weight = args.rej_weight * (1 - iter / args.num_iters)
+        z_logits = preprocess_logits(z_logits)
+        y_logits_reshaped = preprocess_logits(y_logits_reshaped)
 
-        # 组合总损失
-        loss = goal_weight * c_loss_1 + 1 * flu_loss - rej_weight * c_loss_2  + kl_loss_weight * kl_closs
+        kl_loss = compute_stable_kl_loss(z_logits, y_logits_reshaped)
+        
+        # 检查并处理NaN
+        if torch.isnan(kl_loss):
+            print("Warning: KL loss is NaN, resetting to zero")
+            kl_loss = torch.zeros_like(kl_loss)
+        
+        # 使用更保守的权重
+        #progress = iter / args.num_iters
+        # kl_loss_weight = args.kl_max_weight * 0.5  # 固定较小的KL权重
+        
+        # 其他权重保持稳定
+        # goal_weight = args.goal_weight  # 保持原始权重
+        # rej_weight = args.rej_weight    # 保持原始权重
+        # flu_weight = 0.5                # 保持固定值
+        
+        # 计算总loss时添加差异化clipping和动态权重
+        progress = iter / args.num_iters
+        
+        #动态调整权重
+        flu_weight = 0.8 + 0.2 * progress  # 流畅度权重随训练进度增加
+        kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))  # KL权重随训练进度减少
+        goal_weight = args.goal_weight * (1.0 - 0.3 * progress)  # 目标权重稍微降低
+        rej_weight = args.rej_weight * (1.0 - 0.2 * progress)  # 拒绝权重稍微降低
+
+        #使用动态clipping阈值
+        flu_clip = 2.0 + progress  # 流畅度loss的clipping阈值随训练增加
+        kl_clip = 0.5 * (1.0 - progress)  # KL loss的clipping阈值随训练减少
+        
+        loss = (
+            goal_weight * torch.clamp(c_loss_1, max=1.5) + 
+            flu_weight * torch.clamp(flu_loss, max=flu_clip) - 
+            rej_weight * torch.clamp(c_loss_2, max=1.5) + 
+            kl_loss_weight * torch.clamp(kl_loss, max=kl_clip)
+        )
+        
+        # 使用softplus来平滑loss
+        loss = F.softplus(loss)
         loss = loss.mean()
-        # logger.info(f"  - Total Loss: {loss.item()}")
+
+        # 记录loss和权重
+        if iter % 100 == 0:
+            print(f"Step {iter}, Total Loss: {loss.item():.4f}, KL Loss: {kl_loss.item():.4f}")
+            print(f"Weights - Goal: {goal_weight:.3f}, KL: {kl_loss_weight:.3f}, Rej: {rej_weight:.3f}, Flu: {flu_weight:.3f}")
 
         if args.wandb:
             # 记录损失和范数到wandb
@@ -972,7 +1096,13 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 'loss/fluency': flu_loss.mean().item(),
                 'loss/target': c_loss_1.mean().item(),
                 'loss/bleu': c_loss_2.mean().item(),
-                # 'loss/KL': kl_closs.mean().item(),
+                'loss/KL': kl_loss.mean().item(),
+                'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
+                'progress': progress,
+                'weights/goal': goal_weight,
+                'weights/fluency': flu_weight,
+                'weights/rejection': rej_weight,
+                'weights/kl': kl_loss_weight,
                 'norm/epsilon': torch.norm(epsilon).item(),
                 'norm/y_logits': torch.norm(y_logits).item(),
                 'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
@@ -980,37 +1110,30 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 'learning_rate': scheduler.get_last_lr()[0]
             }, step=wandb_step)
 
-        # 如果不是最后一次迭代，进行反向传播和优化
-        if iter < args.num_iters - 1:
-            loss.backward(retain_graph=True)
-
-            if args.wandb:
-                # 记录梯度到wandb，使用相同的step
-                wandb.log({
-                    'grad/epsilon': torch.norm(epsilon.grad).item()
-                }, step=wandb_step)  # 使用相同的step
-
-            # # 记录梯度信息
-            logger.info(f"\n[Iter {iter + 1}] Gradient norms:")
             if epsilon.grad is not None:
-                logger.info("  - Epsilon grad norm: %.1f" % torch.norm(epsilon.grad).item())
-                # print("epsilon grad:", epsilon.grad)
-                # print("epsilon grad max:", epsilon.grad.max().item())
-                # print("epsilon grad min:", epsilon.grad.min().item())
-                # print("epsilon grad norm:", torch.norm(epsilon.grad).item())
-            else:
-                logger.info("  - Epsilon grad is None")
+                wandb.log({
+                    'grad/epsilon': torch.norm(epsilon.grad).item(),
+                    'grad/max': epsilon.grad.max().item(),
+                    'grad/min': epsilon.grad.min().item()
+                }, step=wandb_step)
 
-            log_gradients(model.named_parameters())
-
-            optim.step()    # 优化器更新
-            # print(f"epsilon: {iter}", epsilon)
-            # epsilon.data = torch.clamp(epsilon.data, min=-1.0, max=1.0)
-            scheduler.step()  # 学习率调度
-            last_lr = scheduler.get_last_lr()[0]
-            # logger.info(f"[Iter {iter+1}] Learning rate: {last_lr}")
-
-
+        # 梯度累积
+        accumulation_steps = 6
+        loss = loss / accumulation_steps
+        loss.backward(retain_graph=True)
+        
+        if (iter + 1) % accumulation_steps == 0:
+            # 应用梯度裁剪，使用较小的阈值
+            max_grad_norm = 0.08
+            torch.nn.utils.clip_grad_norm_([epsilon], max_grad_norm)
+            # 优化器步进
+            optim.step()
+            optim.zero_grad()
+            scheduler.step()
+        
+        # 添加正则化项
+        l2_reg = torch.norm(epsilon) * 0.01
+        loss += l2_reg
 
         # 定期打印生成结果
         if args.verbose and ((iter + 1) % args.print_every == 0 or iter == 0 or iter + 1 == args.num_iters):
@@ -1027,7 +1150,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 logger.info(tokenizer.decode(output_ids[0], skip_special_tokens=True))
                 logger.info(
                     "%d, loss: %.4f,flu_loss: %.4f, c_loss_1: %.4f, c_loss_2: %.4f,k lr: %.4f, |%s|" % (
-                        iter + 1, loss.item(), flu_loss[bi].item(), c_loss_1[bi].item(),c_loss_2[bi].item(),last_lr,
+                        iter + 1, loss.item(), flu_loss[bi].item(), c_loss_1[bi].item(),c_loss_2[bi].item(),scheduler.get_last_lr()[0],
                         text_post[bi]))
 
         # 添加噪声以增加多样性
@@ -1035,7 +1158,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
             # 解析噪声参数
             large_noise_iters = [int(_) for _ in args.large_noise_iters.split(',')]
             large_gs_stds = [float(_) for _ in args.large_gs_std.split(',')]
-            noise_std = 0.
+            noise_std = args.gs_std * 0.7 
 
             # 根据迭代次数决定噪声大小
             if iter % args.noise_iters == 0:
