@@ -13,6 +13,11 @@ from nltk.tokenize import word_tokenize
 
 import sys
 import os
+
+from requests import delete
+
+from opt_util import load_model_and_tokenizer
+
 if os.path.isdir('/var/karen'):
     os.environ['TRANSFORMERS_CACHE'] = '/var/karen/workspace/Refinement-Generation/cache'
     sys.path.insert(0, '/var/karen/workspace/Refinement-Generation/')
@@ -22,7 +27,6 @@ from tqdm import tqdm
 from difflib import SequenceMatcher
 
 from bleuloss import batch_log_bleulosscnn_ae
-
 
 def embed_inputs(embedding, logits, x_onehot=None, z_onehot=None, device='cuda'):
     '''
@@ -1081,6 +1085,7 @@ def calculate_coverage(output_ln, key_words):
 def get_gpt_ppl(text_list, gpt_model, gpt_tokenizer, device):
     # gpt_model = GPT2LMHeadModel.from_pretrained("./models/gpt2-medium").to(device)
     # gpt_tokenizer = GPT2Tokenizer.from_pretrained("./models/gpt2-")
+
     gpt_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     
     ppl_list = []
@@ -1093,7 +1098,9 @@ def get_gpt_ppl(text_list, gpt_model, gpt_tokenizer, device):
         target_ids = tokens.clone().to(device)
         loss = gpt_model(tokens, labels = target_ids).loss
         ppl_list.append(torch.exp(loss).detach().cpu().numpy())
-
+    # del gpt_model
+    # del gpt_tokenizer
+    # torch.cuda.empty_cache()
     return ppl_list
 
 def rank_generations(text_list, x, z, mode="abductive"):
