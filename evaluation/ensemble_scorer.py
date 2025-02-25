@@ -31,18 +31,24 @@ class Scorer():
     def compute_scores(self):
         total_scores = {}
         for scorer, method in self.scorers:
-            # print('computing %s score...'%(scorer.method()))
-            score, scores = scorer.compute_score(self.gt, self.ref)
-            if type(method) == list:
-                # for sc, scs, m in zip(score, scores, method):
-                    # print("%s: %0.3f"%(m, sc))
-                total_scores["Bleu"] = score
-            else:
-                # print("%s: %0.3f"%(method, score))
-                total_scores[method] = score
+            try:
+                score, scores = scorer.compute_score(self.gt, self.ref)
+                if type(method) == list:
+                    # Store each BLEU score individually
+                    for sc, m in zip(score, method):
+                        total_scores[m] = sc
+                else:
+                    total_scores[method] = score
+            except Exception as e:
+                print(f"Error computing score for {method}: {e}")
+                continue
         
-        for key,value in total_scores.items():
-            print('{}:{}'.format(key,value))
+        # 打印分数
+        for key, value in total_scores.items():
+            print('{}:{}'.format(key, value))
+        
+        # 确保返回total_scores
+        return total_scores if total_scores else {"error": "No scores computed"}
 
 
 if __name__ == "__main__":
