@@ -88,7 +88,10 @@ def options():
     parser.add_argument("--proxy_model_path", type=str)
     parser.add_argument("--kl_max_weight", type=float, default=0.1)
     parser.add_argument("--wandb_project", type=str)
-
+    #强化学习
+    parser.add_argument("--rl_eval_interval", type=int, default=100)
+    parser.add_argument("--kl_threshold", type=float, default=5.0)
+    parser.add_argument("--forbidden_threshold", type=float, default=0.8)
     args = parser.parse_args()
     return args
 
