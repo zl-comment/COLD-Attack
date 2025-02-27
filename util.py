@@ -451,15 +451,15 @@ def soft_nll(logits_perturbed, logits, eps=1e-7):
     p = torch.clamp(p, min=eps)
     logp = F.log_softmax(logits, dim=-1)
     
-    # 打印概率分布的范围
-    print(f"Probability ranges:")
-    print(f"p: [{p.min()}, {p.max()}]")
-    print(f"logp: [{logp.min()}, {logp.max()}]")
+    # # 打印概率分布的范围
+    # print(f"Probability ranges:")
+    # print(f"p: [{p.min()}, {p.max()}]")
+    # print(f"logp: [{logp.min()}, {logp.max()}]")
     
     loss = -(p * logp).sum(dim=-1).mean(dim=-1)
     
     # 打印损失值
-    print(f"Loss value: {loss.mean().item()}")
+    # print(f"Loss value: {loss.mean().item()}")
     
     return loss
 
