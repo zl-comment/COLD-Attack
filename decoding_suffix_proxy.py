@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -973,8 +975,8 @@ def get_rl_reward(generated_texts, model, tokenizer, words, device, args):
 
     # 定义奖励信号：增加攻击成功率的权重，使得优化过程更多地关注成功的文本生成
     # 调整流畅度和禁用词的影响力
-    fluency_weight = 0.4
-    forbidden_weight = 0.6
+    fluency_weight = 0.6
+    forbidden_weight = 0.9
     success_weight = 2.0  # 如果不稳定，可以尝试 1.0 或者更大/更小
 
     rl_reward = (success_weight * success_rate
@@ -987,35 +989,42 @@ def get_rl_reward(generated_texts, model, tokenizer, words, device, args):
 
 
 
-#
-# class EnhancedDirectionMemory:
-#     def __init__(self, capacity=10, forbidden_words=None):
-#         self.capacity = capacity
-#         self.directions = []
-#         self.rewards = []
-#         self.forbidden_words = forbidden_words or []
-#
-#     def add_direction(self, direction, reward, text_quality):
-#         """只有当文本质量满足要求时才添加方向"""
-#         if text_quality:  # text_quality是一个布尔值，表示文本是否满足所有质量要求
-#             if len(self.directions) >= self.capacity:
-#                 # 确保rewards在CPU上并转换为numpy数组
-#                 cpu_rewards = [r.cpu().item() if torch.is_tensor(r) else r for r in self.rewards]
-#                 worst_idx = np.argmin(cpu_rewards)
-#                 self.directions.pop(worst_idx)
-#                 self.rewards.pop(worst_idx)
-#             # 存储时也确保在CPU上
-#             self.directions.append(direction.cpu() if torch.is_tensor(direction) else direction)
-#             self.rewards.append(reward.cpu().item() if torch.is_tensor(reward) else reward)
-#             return True
-#         return False
-#
-#     def get_best_direction(self):
-#         """返回奖励最高的方向"""
-#         if not self.directions:
-#             return None
-#         best_idx = np.argmax(self.rewards)
-#         return self.directions[best_idx]
+def get_rl_conf_sigmoid(success_rate, min_conf=0.05, max_conf=0.2, center=0.5, scale=10):
+    # Sigmoid 映射：center 控制中间拐点，scale 控制曲线陡峭程度
+    # 当 success_rate 接近 center 时，函数值迅速下降
+    sigmoid_value = 1 / (1 + math.exp(scale * (success_rate - center)))
+    # 将 sigmoid 值映射到 [min_conf, max_conf]
+    return min_conf + (max_conf - min_conf) * sigmoid_value
+
+
+# 在RL梯度应用前插入投影操作
+def project_gradient(rl_grad, original_grad):
+    """
+    将RL梯度投影到传统梯度的正交方向
+    """
+    original_grad_unit = original_grad / (original_grad.norm() + 1e-8)
+    # 计算平行分量
+    parallel_component = torch.dot(rl_grad.flatten(), original_grad_unit.flatten()) * original_grad_unit
+    # 得到正交分量
+    orthogonal_grad = rl_grad - parallel_component
+    return orthogonal_grad
+
+# -------------------------------
+# 定义 Gumbel-Softmax 函数（支持 STE）
+# -------------------------------
+def gumbel_softmax_sample(logits, temperature=0.7, hard=True, eps=1e-10):
+    U = torch.rand_like(logits)
+    gumbel_noise = -torch.log(-torch.log(U + eps) + eps)
+    y = logits + gumbel_noise
+    y_soft = F.softmax(y / temperature, dim=-1)
+    if hard:
+        # 得到 one-hot 向量（但梯度通过 y_soft 传递）
+        index = y_soft.max(dim=-1, keepdim=True)[1]
+        y_hard = torch.zeros_like(y_soft).scatter_(-1, index, 1.0)
+        # STE：前向使用 y_hard，反向梯度用 y_soft
+        return (y_hard - y_soft).detach() + y_soft
+    else:
+        return y_soft
 
 def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
                  model_back=None, zz=None):
@@ -1220,7 +1229,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     # 创建优化的扰动参数epsilon
     # 修改初始化代码（在创建优化器之前）
     # 原始代码-v1：
-    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32))  # 创建一个于y_logits维度相同的参数全零张量
+    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32), requires_grad=True)  # 创建一个于y_logits维度相同的参数全零张量
 
     # 改为全局参数：
     # epsilon = torch.nn.Parameter(
@@ -1229,17 +1238,17 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     # )
 
 
-    epsilon.requires_grad = True
+    # epsilon.requires_grad = True
     if args.prefix_length > 0:
         pass
     else:
         # 创建优化器，使用较小的学习率和适度的正则化
         optim = torch.optim.AdamW(
             [epsilon], 
-            lr=args.stepsize * 0.008,
-            weight_decay=0.0005, 
-            betas=(0.9, 0.999),
-            eps=1e-8
+            lr=args.stepsize
+            # weight_decay=0.0005,
+            # betas=(0.9, 0.999),
+            # eps=1e-8
         )
     
     # 创建学习率调度器，使用更平缓的衰减
@@ -1275,560 +1284,11 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
 
     # 在函数开始处添加评估间隔参数
     rl_eval_interval = args.rl_eval_interval # 每100步进行一次强化学习评估 100
-    forbidden_threshold = args.forbidden_threshold  # 允许20%的禁用词出现
+    # forbidden_threshold = args.forbidden_threshold  # 允许20%的禁用词出现
 
     # 在迭代开始时就定义
     current_direction = None
     pbar = tqdm(range(args.num_iters), desc="Optimizing")
-    # for ite in pbar:
-    #     optim.zero_grad()
-    #
-    #     # 将扰动加到logits上
-    #     y_logits_ = y_logits + epsilon
-    #
-    #     soft_forward_y = y_logits_ / 0.001  # 温度缩放
-    #
-    #     # 直通估计器(Straight-through estimator)处理 为了前向传播
-    #     if args.straight_through:
-    #         if mask_t is None:
-    #             soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
-    #         else:
-    #             soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask,
-    #                                              bad_mask=None) / 0.001
-    #
-    #     # 使用模型前向传播
-    #     if args.fp16:
-    #         with torch.autocast(device_type="cuda", dtype=torch.float16):
-    #             y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask,
-    #                                       x_past=x_model_past, bad_mask=None)
-    #     else:
-    #         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-    #             y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask,
-    #                                       x_past=x_model_past, bad_mask=None)
-    #
-    #     # 生成top-k mask
-    #     if args.topk == 0:
-    #         mask_t = None
-    #     else:
-    #         _, indices_t = torch.topk(y_logits_t, args.topk)
-    #         mask_t = torch.zeros_like(y_logits_t).scatter_(2, indices_t, 1)
-    #
-    #     flu_loss = soft_nll(
-    #         top_k_filter_3d(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=x_mask, bad_mask=None),
-    #         y_logits_ / args.input_lgt_temp)
-    #
-    #     # 计算xyz序列的logits
-    #     soft_forward_y_ = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
-    #     if args.fp16:
-    #         with torch.autocast(device_type="cuda", dtype=torch.float16):
-    #             xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
-    #     else:
-    #         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-    #             xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
-    #
-    #     # 重塑张量维度
-    #     bz = args.batch_size
-    #     lg = xyz_logits.shape[1]
-    #     st = xy_length - 1
-    #     ed = xyz_logits.shape[1] - 1
-    #     xyz_logits = xyz_logits.view(-1, xyz_logits.shape[-1])
-    #     z_logits = torch.cat([xyz_logits[bi * lg + st:bi * lg + ed, :] for bi in range(bz)], dim=0)
-    #
-    #     # print(f"z_logits shape: {z_logits.shape}")
-    #     # print(f"y_logits shape: {y_logits_.shape}")
-    #
-    #     # 计算目标损失
-    #     c_loss_1 = torch.nn.CrossEntropyLoss(reduction='none')(
-    #         z_logits,
-    #         z_t.view(-1))
-    #     c_loss_1 = c_loss_1.view(args.batch_size, -1).mean(-1)
-    #
-    #     # 计算BLEU损失（用于避免生成不良词）避免提示词的后缀生成坏词这个是
-    #     c_loss_2 = batch_log_bleulosscnn_ae(
-    #         decoder_outputs=y_logits_.transpose(0, 1),
-    #         target_idx=bad_words_t,
-    #         ngram_list=[1]
-    #     )
-    #
-    #     # # 重塑z_logits为三维张量 [batch_size, sequence_length, vocab_size]
-    #     # z_logits = z_logits.view(bz, -1, z_logits.size(-1))
-    #     #
-    #     # # 确保序列长度匹配
-    #     # seq_len = min(z_logits.size(1), y_logits_.size(1))
-    #     # z_logits = z_logits[:, :seq_len, :]
-    #     # y_logits_reshaped = y_logits_[:, :seq_len, :]
-    #     #
-    #     # # print(f"Reshaped z_logits: {z_logits.shape}")
-    #     # # print(f"Reshaped y_logits: {y_logits_reshaped.shape}")
-    #     #
-    #     # z_logits = preprocess_logits(z_logits)
-    #     # y_logits_reshaped = preprocess_logits(y_logits_reshaped)
-    #
-    #     # kl_loss = compute_stable_kl_loss(z_logits, y_logits_reshaped)
-    #     #
-    #     # # 检查并处理NaN
-    #     # if torch.isnan(kl_loss):
-    #     #     print("Warning: KL loss is NaN, resetting to zero")
-    #     #     kl_loss = torch.zeros_like(kl_loss)
-    #
-    #     # 使用更保守的权重
-    #     # progress = iter / args.num_iters
-    #     # kl_loss_weight = args.kl_max_weight * 0.5  # 固定较小的KL权重
-    #
-    #     # 其他权重保持稳定
-    #     # goal_weight = args.goal_weight  # 保持原始权重
-    #     # rej_weight = args.rej_weight    # 保持原始权重
-    #     # flu_weight = 0.5                # 保持固定值
-    #
-    #     # 计算总loss时添加差异化clipping和动态权重
-    #     progress = ite / args.num_iters
-    #
-    #
-    #
-    #     # 动态调整权重
-    #     flu_weight = 0.8 + 0.2 * progress  # 流畅度权重随训练进度增加
-    #     # kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))  # KL权重随训练进度减少
-    #     goal_weight = args.goal_weight * (1.0 - 0.3 * progress)  # 目标权重稍微降低
-    #     rej_weight = args.rej_weight * (1.0 - 0.2 * progress)  # 拒绝权重稍微降低
-    #
-    #     # 使用动态clipping阈值
-    #     flu_clip = 2.0 + progress  # 流畅度loss的clipping阈值随训练增加
-    #     kl_clip = 0.5 * (1.0 - progress)  # KL loss的clipping阈值随训练减少
-    #
-    #     loss = (
-    #             goal_weight * torch.clamp(c_loss_1, max=1.5) +
-    #             flu_weight * torch.clamp(flu_loss, max=flu_clip) -
-    #             rej_weight * torch.clamp(c_loss_2, max=1.5)
-    #             # kl_loss_weight * torch.clamp(kl_loss, max=kl_clip)
-    #     )
-    #     if ite % rl_eval_interval == 0 :
-    #         # 解码当前文本
-    #         current_text, _, last_text_ids = decode_with_model_topk(
-    #             model, y_logits_, args.topk, soft_forward_x, x_model_past,
-    #             tokenizer, extra_mask=None, bad_mask=None
-    #         )
-    #         # 生成完整输出用于评估
-    #         prompts = [x + " " + text for text in current_text[:args.batch_size]]
-    #         # 初始化一个空列表，用于存储生成的文本
-    #         generated_texts = []
-    #
-    #         # 逐条处理 prompts
-    #         for prompt in prompts:
-    #             try:
-    #                 # 将单条 prompt 转换为 input_ids
-    #                 input_ids = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).input_ids.to(
-    #                     device)
-    #
-    #                 # 生成文本
-    #                 output_ids = model.generate(
-    #                     inputs=input_ids,
-    #                     temperature=0.7,
-    #                     max_length=512,
-    #                     do_sample=True,
-    #                     top_k=args.topk,
-    #                     num_return_sequences=1
-    #                 )
-    #
-    #                 # 解码生成的文本
-    #                 decoded_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    #                 generated_texts.append(decoded_text)  # 将生成的文本添加到列表中
-    #
-    #             except Exception as e:
-    #                 print(f"处理提示时发生错误：{e}")
-    #                 generated_texts.append(None)  # 如果出错，添加 None 到列表中
-    #
-    #         # 计算强化学习的奖励
-    #         rl_reward = get_rl_reward(generated_texts,model, tokenizer, words,device,args)
-    #
-    #         # 使用指数移动平均平滑奖励
-    #         alpha = 0.9  # 平滑因子
-    #         if 'avg_rl_reward' not in locals():
-    #             avg_rl_reward = rl_reward
-    #         else:
-    #             avg_rl_reward = alpha * avg_rl_reward + (1 - alpha) * rl_reward
-    #
-    #         # 计算 RL 相关的 loss
-    #         RL_loss = -avg_rl_reward  # 目标是最大化 rl_reward，所以取负值
-    #
-    #         # 调整 loss，使得优化方向合适
-    #         loss = loss + RL_loss
-    #
-    #         wandb.log({
-    #             'loss/rl_reward': rl_reward,  # 记录强化学习奖励
-    #             'loss/avg_rl_reward': avg_rl_reward,
-    #
-    #         }, step=ite + 1)
-    #     # 使用soft plus来平滑loss
-    #     loss = F.softplus(loss)
-    #     loss = loss.mean()
-    # 在训练迭代中：
-    # 在循环外部初始化记忆库
-
-    # for ite in pbar:
-    #     optim.zero_grad()
-    #
-    #     # 将扰动加到 y_logits 上（此处保持原有流程）
-    #     #原代码-v1
-    #     y_logits_ = y_logits + epsilon
-    #     # 找到代码中的 y_logits_ = y_logits + epsilon
-    #     # # 修改为：
-    #     # y_logits_ = y_logits + epsilon.expand_as(y_logits)  # 自动广播到[B, L, V]
-    #
-    #     soft_forward_y = y_logits_ / 0.001  # 温度缩放
-    #
-    #     # 直通估计器（Straight-through estimator）
-    #     if args.straight_through:
-    #         if mask_t is None:
-    #             soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
-    #         else:
-    #             soft_forward_y = top_k_filter_3d(
-    #                 y_logits_, args.topk, mask=mask_t, extra_mask=x_mask, bad_mask=None
-    #             ) / 0.001
-    #
-    #     # 模型前向传播，得到 y_logits_t（后续用于 flu_loss、c_loss_1 等计算，保持不变）
-    #     if args.fp16:
-    #         with torch.autocast(device_type="cuda", dtype=torch.float16):
-    #             y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk,
-    #                                       extra_mask=x_mask, x_past=x_model_past, bad_mask=None)
-    #     else:
-    #         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-    #             y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk,
-    #                                       extra_mask=x_mask, x_past=x_model_past, bad_mask=None)
-    #
-    #     # 生成 top-k mask
-    #     if args.topk == 0:
-    #         mask_t = None
-    #     else:
-    #         _, indices_t = torch.topk(y_logits_t, args.topk)
-    #         mask_t = torch.zeros_like(y_logits_t).scatter_(2, indices_t, 1)
-    #
-    #     flu_loss = soft_nll(
-    #         top_k_filter_3d(
-    #             y_logits_t / args.output_lgt_temp, args.topk, extra_mask=x_mask, bad_mask=None
-    #         ),
-    #         y_logits_ / args.input_lgt_temp
-    #     )
-    #
-    #     # 以下部分计算 c_loss_1、c_loss_2 与其它损失，保持原样
-    #     soft_forward_y_ = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
-    #     if args.fp16:
-    #         with torch.autocast(device_type="cuda", dtype=torch.float16):
-    #             xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
-    #     else:
-    #         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-    #             xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
-    #
-    #     bz = args.batch_size
-    #     lg = xyz_logits.shape[1]
-    #     st = xy_length - 1
-    #     ed = xyz_logits.shape[1] - 1
-    #     xyz_logits = xyz_logits.view(-1, xyz_logits.shape[-1])
-    #     z_logits = torch.cat([xyz_logits[bi * lg + st:bi * lg + ed, :] for bi in range(bz)], dim=0)
-    #
-    #     c_loss_1 = torch.nn.CrossEntropyLoss(reduction='none')(z_logits, z_t.view(-1))
-    #     c_loss_1 = c_loss_1.view(args.batch_size, -1).mean(-1)
-    #
-    #     c_loss_2 = batch_log_bleulosscnn_ae(
-    #         decoder_outputs=y_logits_.transpose(0, 1),
-    #         target_idx=bad_words_t,
-    #         ngram_list=[1]
-    #     )
-    #
-    #     progress = ite / args.num_iters
-    #     flu_weight = 0.8 + 0.2 * progress
-    #     goal_weight = args.goal_weight * (1.0 - 0.3 * progress)
-    #     rej_weight = args.rej_weight * (1.0 - 0.2 * progress)
-    #     flu_clip = 2.0 + progress
-    #
-    #     loss = (
-    #             goal_weight * torch.clamp(c_loss_1, max=1.5) +
-    #             flu_weight * torch.clamp(flu_loss, max=flu_clip) -
-    #             rej_weight * torch.clamp(c_loss_2, max=1.5)
-    #     )
-    #
-    #     rl_conf = 0.05
-    #
-    #     # 每隔 rl_eval_interval 进行 RL 更新：
-    #     if ite >= 1000  and ite % rl_eval_interval == 0:
-    #
-    #         # 1. 将 y_logits_ 转换为 token_ids 并与 x 拼接
-    #         x_ids = tokenizer(x, return_tensors="pt").input_ids.to(device)  # shape: [1, prompt_len]
-    #         prompt_ids_list = []
-    #         for i in range(args.batch_size):
-    #             y_ids = torch.argmax(y_logits_[i:i + 1], dim=-1)
-    #             prompt_ids = torch.cat([x_ids, y_ids], dim=1)
-    #             prompt_ids_list.append(prompt_ids)
-    #
-    #
-    #
-    #         # RL 更新部分（在 ite >= 1000 且 ite % rl_eval_interval == 0 的分支内）
-    #         #方法二
-    #         # 1. 用生成的文本计算 log 概率（保持原有流程）
-    #         generated_ids_list = []
-    #         gen_log_probs_list = []
-    #         for prompt_ids in prompt_ids_list:
-    #             generated_ids, sample_log_prob = sample_generate_with_log_probs(
-    #                 prompt_ids, model, max_length=512, top_k=args.topk, temperature=0.7,
-    #                 eos_token_id=tokenizer.eos_token_id
-    #             )
-    #             generated_ids_list.append(generated_ids)
-    #             gen_log_probs_list.append(sample_log_prob)
-    #
-    #         final_gen_log_probs = torch.cat(gen_log_probs_list, dim=0)  # shape: [batch]
-    #
-    #         # 2. 解码生成文本
-    #         generated_texts = []
-    #         for gen_ids in generated_ids_list:
-    #             gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-    #             generated_texts.append(gen_text)
-    #
-    #         # 3. 针对每个生成文本分别计算奖励和记录成功标记
-    #         rl_rewards = []
-    #         success_flags = []  # 1 表示攻击成功，0 表示失败
-    #         for text in generated_texts:
-    #             # 调用 query_ollama 返回 True（成功）或 False（失败）
-    #             is_success = query_ollama(text)
-    #             # 注意：get_rl_reward 接受单个样本时传入列表 [text]
-    #             reward = get_rl_reward([text], model, tokenizer, words, device, args)
-    #             success_flags.append(1.0 if is_success else 0.0)
-    #             rl_rewards.append(reward)
-    #         rl_rewards = torch.tensor(rl_rewards, dtype=torch.float, device=device)
-    #         success_flags_tensor = torch.tensor(success_flags, dtype=torch.float, device=device)
-    #
-    #         # 4. 计算 baseline（贪婪生成）奖励s
-    #         greedy_generated_ids_list = []
-    #         with torch.no_grad():
-    #             for prompt_ids in prompt_ids_list:
-    #                 greedy_generated, _ = sample_generate_with_log_probs(
-    #                     prompt_ids, model, max_length=512, top_k=args.topk, temperature=0.7,
-    #                     eos_token_id=tokenizer.eos_token_id
-    #                 )
-    #                 greedy_generated_ids_list.append(greedy_generated)
-    #
-    #         greedy_texts = []
-    #         for gen_ids in greedy_generated_ids_list:
-    #             text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-    #             greedy_texts.append(text)
-    #
-    #         baseline_rewards = []
-    #         for text in greedy_texts:
-    #             base_reward = get_rl_reward([text], model, tokenizer, words, device, args)
-    #             baseline_rewards.append(base_reward)
-    #         baseline_rewards = torch.tensor(baseline_rewards, dtype=torch.float, device=device)
-    #
-    #         # 5. 计算 advantage
-    #         advantage = rl_rewards - baseline_rewards  # [batch]
-    #         adv_mean = advantage.mean()
-    #         adv_std = advantage.std() + 1e-8
-    #         advantage = (advantage - adv_mean) / adv_std
-    #         advantage = advantage.clamp(min=-2.0, max=2.0)
-    #
-    #         # 6. 对成功样本加权放大梯度贡献
-    #         alpha = 1.0  # 超参数：成功样本权重因子，1.0 意味着成功样本权重为 1+1=2.0
-    #         sample_weights = 1.0 + alpha * success_flags_tensor  # 成功样本权重=2.0，失败样本权重=1.0
-    #         weighted_advantage = advantage * sample_weights
-    #         rl_loss = - (weighted_advantage * final_gen_log_probs).mean()
-    #
-    #         # 7. 标准化和缩放 RL Loss
-    #         rl_conf = 0.05
-    #         rl_loss_scaled = rl_conf * rl_loss
-    #
-    #         # 8. 将 RL Loss 加入总 loss
-    #         loss = loss + rl_loss_scaled
-    #
-    #         # 计算每个样本的更新因子：
-    #         # 9. （可选）根据每个样本的成功状态自适应调整 epsilon
-    #         min_epsilon = 0.001  # ε 的下界
-    #         max_epsilon = 0.1  # ε 的上界
-    #         # 成功样本（flag=1.0）乘 0.9，失败样本（flag=0.0）乘 1.1
-    #         update_factors = torch.where(
-    #             success_flags_tensor > 0,
-    #             torch.tensor(0.9, device=epsilon.device),
-    #             torch.tensor(1.1, device=epsilon.device)
-    #         )
-    #         # 将 update_factors 的形状扩展为与 epsilon 相同（例如 [B, 1, 1, ...]）
-    #         new_shape = [epsilon.shape[0]] + [1] * (epsilon.dim() - 1)
-    #         update_factors = update_factors.view(new_shape)
-    #
-    #         # 对每个样本的 epsilon 进行更新（逐元素相乘）
-    #         epsilon.data.mul_(update_factors)
-    #
-    #         # 限制 epsilon 的每个元素在 [min_epsilon, max_epsilon] 内
-    #         epsilon.data.clamp_(min=min_epsilon, max=max_epsilon)
-    #
-    #
-    #         # # 10. （可选）根据当前批次成功率自适应调整 epsilon
-    #         # batch_success_rate = success_flags_tensor.mean().item()  # 批次平均成功率
-    #         # target_rate = 0.8  # 目标成功率，可根据需要调整
-    #         # min_epsilon = 0.001  # ε 的下界
-    #         # max_epsilon = 0.1  # ε 的上界
-    #         # if batch_success_rate < target_rate:
-    #         #     epsilon.data.mul_(1.1)  # 成功率低，则将所有元素乘以 1.1
-    #         # else:
-    #         #     epsilon.data.mul_(0.9)  # 成功率高，则将所有元素乘以 0.9
-    #         #
-    #         # # 限制 ε 的范围
-    #         # epsilon.data.clamp_(min=min_epsilon, max=max_epsilon)
-    #         # loss = F.softplus(loss)
-    #         # loss = loss.mean()
-    #
-    #
-    #
-    #
-    #         # 11. 记录 RL 部分指标到 wandb（可选）
-    #         # wandb.log({
-    #         #     'loss/rl_loss': rl_loss.item(),
-    #         #     'loss/rl_loss_scaled': rl_loss_scaled.item(),
-    #         #     'loss/rl_rewards': rl_rewards.mean().item(),
-    #         #     'loss/baseline_rewards': baseline_rewards.mean().item(),
-    #         #     # 'rl/batch_success_rate': batch_success_rate,
-    #         #     'epsilon_mean': epsilon.mean().item()  # 也可以记录均值
-    #         # }, step=ite + 1)
-    #         # loss = F.softplus(loss)
-    #         # loss = loss.mean()
-    #
-    #         # ===== 监控建议 =====
-    #         if args.wandb and (ite % rl_eval_interval == 0 or ite == 0):
-    #             wandb.log({
-    #                 'adv/success_rate': current_success_rate,
-    #                 'adv/memory_size': len(success_memory['logits']),
-    #                 'param/epsilon_max': epsilon.data.abs().max().item(),
-    #                 'loss/rl_loss': rl_loss.item(),
-    #                 'loss/rl_loss_scaled': rl_loss_scaled.item(),
-    #                 'loss/rl_rewards': rl_rewards.mean().item(),
-    #                 'loss/baseline_rewards': baseline_rewards.mean().item(),
-    #                 'epsilon_mean': epsilon.mean().item()
-    #             }, step=ite + 1)
-    #     #方法一
-    #     #     # 2. 逐个生成 & 记录 log 概率
-    #     #     generated_ids_list = []
-    #     #     gen_log_probs_list = []
-    #     #     for prompt_ids in prompt_ids_list:
-    #     #         generated_ids, sample_log_prob = sample_generate_with_log_probs(
-    #     #             prompt_ids, model, max_length=512, top_k=args.topk, temperature=0.7,
-    #     #             eos_token_id=tokenizer.eos_token_id
-    #     #         )
-    #     #         generated_ids_list.append(generated_ids)
-    #     #         gen_log_probs_list.append(sample_log_prob)
-    #     #
-    #     #     final_gen_log_probs = torch.cat(gen_log_probs_list, dim=0)  # [batch]
-    #     #
-    #     #     # 3. 解码文本
-    #     #     generated_texts = []
-    #     #     for gen_ids in generated_ids_list:
-    #     #         gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-    #     #         generated_texts.append(gen_text)
-    #     #
-    #     #     # 4. 计算 RL 奖励
-    #     #     rl_rewards = []
-    #     #     for text in generated_texts:
-    #     #         reward = get_rl_reward([text], model, tokenizer, words, device, args)
-    #     #         rl_rewards.append(reward)
-    #     #     rl_rewards = torch.tensor(rl_rewards, dtype=torch.float, device=device)
-    #     #
-    #     #     # 5. 计算 baseline
-    #     #     greedy_generated_ids_list = []
-    #     #     with torch.no_grad():
-    #     #         for prompt_ids in prompt_ids_list:
-    #     #             greedy_generated, _ = sample_generate_with_log_probs(
-    #     #                 prompt_ids, model, max_length=512, top_k=args.topk, temperature=0.7,
-    #     #                 eos_token_id=tokenizer.eos_token_id
-    #     #             )
-    #     #             greedy_generated_ids_list.append(greedy_generated)
-    #     #
-    #     #         greedy_texts = []
-    #     #         for gen_ids in greedy_generated_ids_list:
-    #     #             text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-    #     #             greedy_texts.append(text)
-    #     #
-    #     #         baseline_rewards = []
-    #     #         for text in greedy_texts:
-    #     #             base_reward = get_rl_reward([text], model, tokenizer, words, device, args)
-    #     #             baseline_rewards.append(base_reward)
-    #     #         baseline_rewards = torch.tensor(baseline_rewards, dtype=torch.float, device=device)
-    #     #
-    #     #     # 6. 计算优势并构造 RL 损失
-    #     #     advantage = rl_rewards - baseline_rewards  # [batch]
-    #     #
-    #     #     # (A) 对 advantage 做标准化或截断，减少极端值带来的不稳定
-    #     #     adv_mean = advantage.mean()
-    #     #     adv_std = advantage.std() + 1e-8
-    #     #     advantage = (advantage - adv_mean) / adv_std  # 标准化
-    #     #     advantage = advantage.clamp(min=-2.0, max=2.0)  # 进一步截断
-    #     #
-    #     #     rl_loss = - (advantage * final_gen_log_probs).mean()
-    #     #
-    #     #     # (B) 给 RL Loss 乘以一个系数
-    #     #     rl_loss_scaled = rl_conf * rl_loss
-    #     #
-    #     #     # (C) 将 RL 损失加入总 loss
-    #     #     loss = loss + rl_loss_scaled
-    #     #
-    #     #     wandb.log({
-    #     #         'loss/rl_loss': rl_loss.item(),
-    #     #         'loss/rl_loss_scaled': rl_loss_scaled.item(),
-    #     #         'loss/rl_rewards': rl_rewards.mean().item(),
-    #     #         'loss/baseline_rewards': baseline_rewards.mean().item()
-    #     #     }, step=ite + 1)
-    #     #
-    #     loss = F.softplus(loss)
-    #     loss = loss.mean()
-    #
-    #
-    #     # # 记录loss和权重
-    #     # if ite % 100 == 0:
-    #     #     print(f"Step {ite}, Total Loss: {loss.item():.4f}, KL Loss: {kl_loss.item():.4f}")
-    #     #     print(
-    #     #         f"Weights - Goal: {goal_weight:.3f}, KL: {kl_loss_weight:.3f}, Rej: {rej_weight:.3f}, Flu: {flu_weight:.3f}")
-    #
-    #     if args.wandb:
-    #         # 记录损失和范数到wandb
-    #         wandb_step = ite + 1  # 使用1-based的step计数
-    #
-    #         wandb.log({
-    #             'loss/total': loss.mean().item(),
-    #             'loss/fluency': flu_loss.mean().item(),
-    #             'loss/target': c_loss_1.mean().item(),
-    #             'loss/bleu': c_loss_2.mean().item(),
-    #             # 'loss/KL': kl_loss.mean().item(),
-    #             'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
-    #             'progress': progress,
-    #             'weights/goal': goal_weight,
-    #             'weights/fluency': flu_weight,
-    #             'weights/rejection': rej_weight,
-    #             # 'weights/kl': kl_loss_weight,
-    #             'norm/epsilon': torch.norm(epsilon).item(),
-    #             'norm/y_logits': torch.norm(y_logits).item(),
-    #             'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
-    #             'norm/y_logits_t': torch.norm(y_logits_t).item(),
-    #             'learning_rate': scheduler.get_last_lr()[0]
-    #         }, step=wandb_step)
-    #
-    #         if epsilon.grad is not None:
-    #             wandb.log({
-    #                 'grad/epsilon': torch.norm(epsilon.grad).item(),
-    #                 'grad/max': epsilon.grad.max().item(),
-    #                 'grad/min': epsilon.grad.min().item()
-    #             }, step=wandb_step)
-    #
-    #     # 梯度累积
-    #     accumulation_steps = 6
-    #     loss = loss / accumulation_steps
-    #     loss.backward()
-    #
-    #     if (ite + 1) % accumulation_steps == 0:
-    #         # 应用梯度裁剪，使用较小的阈值
-    #         max_grad_norm = 0.08
-    #         torch.nn.utils.clip_grad_norm_([epsilon], max_grad_norm)
-    #         # 优化器步进
-    #         optim.step()
-    #         optim.zero_grad()
-    #         scheduler.step()
-    #
-    #     # 添加正则化项
-    #     l2_reg = torch.norm(epsilon) * 0.01
-    #     loss += l2_reg
-
 
     # 在训练循环外部初始化成功记忆库（保证持久性）
     success_memory = {
@@ -1840,49 +1300,41 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     for ite in pbar:
         optim.zero_grad()
 
-        # ===== 1. 计算扰动后的 logits =====
-        # 使用 epsilon 的当前值，每个样本独立探索（初期 epsilon 为各自参数）
-        # 注意：使用 expand_as 确保广播正确，但这里 epsilon 已经是 [B, L, V]
+        # 将扰动加到logits上
         y_logits_ = y_logits + epsilon
 
-        # 这里温度缩放（你可以根据需要调整）
-        soft_forward_y = y_logits_ / 0.001
+        soft_forward_y = y_logits_ / 0.001  # 温度缩放
 
-        # ===== 2. Straight-through estimator 处理 =====
+        # 直通估计器(Straight-through estimator)处理 为了前向传播
         if args.straight_through:
             if mask_t is None:
                 soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
             else:
-                soft_forward_y = top_k_filter_3d(
-                    y_logits_, args.topk, mask=mask_t, extra_mask=x_mask, bad_mask=None
-                ) / 0.001
+                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask,
+                                                 bad_mask=None) / 0.001
 
-        # ===== 3. 模型前向传播 =====
+        # 使用模型前向传播
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk,
-                                          extra_mask=x_mask, x_past=x_model_past, bad_mask=None)
+                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask,
+                                          x_past=x_model_past, bad_mask=None)
         else:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk,
-                                          extra_mask=x_mask, x_past=x_model_past, bad_mask=None)
+                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask,
+                                          x_past=x_model_past, bad_mask=None)
 
-        # ===== 4. 生成 top-k mask =====
+        # 生成top-k mask
         if args.topk == 0:
             mask_t = None
         else:
             _, indices_t = torch.topk(y_logits_t, args.topk)
             mask_t = torch.zeros_like(y_logits_t).scatter_(2, indices_t, 1)
 
-        # ===== 5. 计算 flu_loss =====
         flu_loss = soft_nll(
-            top_k_filter_3d(
-                y_logits_t / args.output_lgt_temp, args.topk, extra_mask=x_mask, bad_mask=None
-            ),
-            y_logits_ / args.input_lgt_temp
-        )
+            top_k_filter_3d(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=x_mask, bad_mask=None),
+            y_logits_ / args.input_lgt_temp)
 
-        # ===== 6. 计算其它损失项 =====
+        # 计算xyz序列的logits
         soft_forward_y_ = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -1891,6 +1343,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
 
+        # 重塑张量维度
         bz = args.batch_size
         lg = xyz_logits.shape[1]
         st = xy_length - 1
@@ -1898,60 +1351,117 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         xyz_logits = xyz_logits.view(-1, xyz_logits.shape[-1])
         z_logits = torch.cat([xyz_logits[bi * lg + st:bi * lg + ed, :] for bi in range(bz)], dim=0)
 
-        c_loss_1 = torch.nn.CrossEntropyLoss(reduction='none')(z_logits, z_t.view(-1))
+        # print(f"z_logits shape: {z_logits.shape}")
+        # print(f"y_logits shape: {y_logits_.shape}")
+
+        # 计算目标损失
+        c_loss_1 = torch.nn.CrossEntropyLoss(reduction='none')(
+            z_logits,
+            z_t.view(-1))
         c_loss_1 = c_loss_1.view(args.batch_size, -1).mean(-1)
 
+        # 计算BLEU损失（用于避免生成不良词）
         c_loss_2 = batch_log_bleulosscnn_ae(
             decoder_outputs=y_logits_.transpose(0, 1),
             target_idx=bad_words_t,
             ngram_list=[1]
         )
 
-        progress = ite / args.num_iters
-        flu_weight = 0.8 + 0.2 * progress
-        goal_weight = args.goal_weight * (1.0 - 0.3 * progress)
-        rej_weight = args.rej_weight * (1.0 + 0.3 * progress)
-        flu_clip = 2.0 + progress
+        # 重塑z_logits为三维张量 [batch_size, sequence_length, vocab_size]
+        z_logits = z_logits.view(bz, -1, z_logits.size(-1))
 
-        # ===== 7. 计算主损失 =====
+        # 确保序列长度匹配
+        seq_len = min(z_logits.size(1), y_logits_.size(1))
+        z_logits = z_logits[:, :seq_len, :]
+        y_logits_reshaped = y_logits_[:, :seq_len, :]
+
+        # print(f"Reshaped z_logits: {z_logits.shape}")
+        # print(f"Reshaped y_logits: {y_logits_reshaped.shape}")
+
+        z_logits = preprocess_logits(z_logits)
+        y_logits_reshaped = preprocess_logits(y_logits_reshaped)
+
+        kl_loss = compute_stable_kl_loss(z_logits, y_logits_reshaped)
+
+        # 检查并处理NaN
+        if torch.isnan(kl_loss):
+            print("Warning: KL loss is NaN, resetting to zero")
+            kl_loss = torch.zeros_like(kl_loss)
+
+        # 使用更保守的权重
+        # progress = iter / args.num_iters
+        # kl_loss_weight = args.kl_max_weight * 0.5  # 固定较小的KL权重
+
+        # 其他权重保持稳定
+        # goal_weight = args.goal_weight  # 保持原始权重
+        # rej_weight = args.rej_weight    # 保持原始权重
+        # flu_weight = 0.5                # 保持固定值
+
+        # 计算总loss时添加差异化clipping和动态权重
+        progress = ite / args.num_iters
+
+        # 动态调整权重
+        flu_weight = 0.8 + 0.4 * progress  # 流畅度权重随训练进度增加
+        kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))  # KL权重随训练进度减少
+        goal_weight = args.goal_weight * (1.0 - 0.3 * progress)  # 目标权重稍微降低
+        rej_weight = args.rej_weight * (1.0 + 0.5 * progress)  # 拒绝权重稍微增加
+
+        # 使用动态clipping阈值
+        flu_clip = 2.0 + progress  # 流畅度loss的clipping阈值随训练增加
+        kl_clip = 0.5 * (1.0 - progress)  # KL loss的clipping阈值随训练减少
+
         loss = (
                 goal_weight * torch.clamp(c_loss_1, max=1.5) +
                 flu_weight * torch.clamp(flu_loss, max=flu_clip) -
-                rej_weight * torch.clamp(c_loss_2, max=1.5)
+                rej_weight * torch.clamp(c_loss_2, max=1.5) +
+                kl_loss_weight * torch.clamp(kl_loss, max=kl_clip)
         )
 
+        # 使用soft plus来平滑loss
+        loss = F.softplus(loss)
+        loss = loss.mean()
+        # 添加正则化项
+        l2_reg = torch.norm(epsilon) * 0.01
+        loss += l2_reg
+
+        # 梯度累积
+        accumulation_steps = 6
+        loss = loss / accumulation_steps
+        loss.backward(retain_graph=True)
+        grad_main = epsilon.grad.clone()
+        # # 记录loss和权重
+        # if ite % 100 == 0:
+        #     print(f"Step {ite}, Total Loss: {loss.item():.4f}, KL Loss: {kl_loss.item():.4f}")
+        #     print(
+        #         f"Weights - Goal: {goal_weight:.3f}, KL: {kl_loss_weight:.3f}, Rej: {rej_weight:.3f}, Flu: {flu_weight:.3f}")
+
         # ===== 8. RL 更新部分（在 ite >= 1000 时启动） =====
-        if ite >= 1000 and ite % args.rl_eval_interval == 0:
-            # --- 8.1 生成文本 & 计算 log 概率 ---
-            x_ids = tokenizer(x, return_tensors="pt").input_ids.to(device)
-            prompt_ids_list = []
-            for i in range(args.batch_size):
-                y_ids = torch.argmax(y_logits_[i:i + 1], dim=-1)
-                prompt_ids = torch.cat([x_ids, y_ids], dim=1)
-                prompt_ids_list.append(prompt_ids)
-
-            generated_ids_list = []
+        if ite >= 1000 and ite % rl_eval_interval == 0:
+            # --- 8.1 生成文本 & 计算 log 概率（使用 Gumbel-Softmax 进行软采样） ---
+            generated_soft_samples = []
             gen_log_probs_list = []
-            for prompt_ids in prompt_ids_list:
-                generated_ids, sample_log_prob = sample_generate_with_log_probs(
-                    prompt_ids, model, max_length=512, top_k=args.topk, temperature=0.7,
-                    eos_token_id=tokenizer.eos_token_id
-                )
-                generated_ids_list.append(generated_ids)
+            for i in range(args.batch_size):
+                # 用 Gumbel-Softmax 生成软样本，保持可微分（hard=True 使用 STE）
+                y_soft = gumbel_softmax_sample(y_logits_[i:i + 1], temperature=0.7, hard=True)
+                generated_soft_samples.append(y_soft)
+                # 计算该样本的 log 概率（这里按最后一维求和，可以根据需要调整）
+                log_prob = torch.log(y_soft + 1e-10)
+                sample_log_prob = log_prob.sum(dim=-1)  # 得到标量
                 gen_log_probs_list.append(sample_log_prob)
-            final_gen_log_probs = torch.cat(gen_log_probs_list, dim=0)  # shape: [B]
+            final_gen_log_probs = torch.cat(gen_log_probs_list, dim=0)  # [B]
 
-            # --- 8.2 解码生成文本 ---
+            # --- 8.2 解码生成文本（用 argmax 转换为离散） ---
             generated_texts = []
-            for gen_ids in generated_ids_list:
-                gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+            for y_soft in generated_soft_samples:
+                y_ids = torch.argmax(y_soft, dim=-1)
+                gen_text = tokenizer.decode(y_ids[0], skip_special_tokens=True)
                 generated_texts.append(gen_text)
 
             # --- 8.3 计算 RL 奖励与成功标记 ---
             rl_rewards = []
             success_flags = []  # 1 表示成功，0 表示失败
             for text in generated_texts:
-                is_success = query_ollama(text)  # 返回 True/False
+                is_success = query_ollama(text)
                 reward = get_rl_reward([text], model, tokenizer, words, device, args)
                 rl_rewards.append(reward)
                 success_flags.append(1.0 if is_success else 0.0)
@@ -1961,15 +1471,13 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
             # --- 8.4 计算 baseline 奖励（贪婪生成） ---
             greedy_generated_ids_list = []
             with torch.no_grad():
-                for prompt_ids in prompt_ids_list:
-                    greedy_generated, _ = sample_generate_with_log_probs(
-                        prompt_ids, model, max_length=512, top_k=args.topk, temperature=0.7,
-                        eos_token_id=tokenizer.eos_token_id
-                    )
-                    greedy_generated_ids_list.append(greedy_generated)
+                for i in range(args.batch_size):
+                    # 用 argmax 生成离散输出作为 baseline
+                    y_ids = torch.argmax(y_logits_[i:i + 1], dim=-1)
+                    greedy_generated_ids_list.append(y_ids)
             greedy_texts = []
-            for gen_ids in greedy_generated_ids_list:
-                text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+            for y_ids in greedy_generated_ids_list:
+                text = tokenizer.decode(y_ids[0], skip_special_tokens=True)
                 greedy_texts.append(text)
             baseline_rewards = []
             for text in greedy_texts:
@@ -1977,25 +1485,27 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 baseline_rewards.append(base_reward)
             baseline_rewards = torch.tensor(baseline_rewards, dtype=torch.float, device=device)
 
-            # --- 8.5 计算优势（使用 REINFORCE 思路）---
+            # --- 8.5 计算优势（使用 REINFORCE 思路） ---
             advantage = rl_rewards - baseline_rewards  # [B]
             adv_mean = advantage.mean()
             adv_std = advantage.std() + 1e-8
             advantage = (advantage - adv_mean) / adv_std
             advantage = advantage.clamp(min=-2.0, max=2.0)
-            alpha_rl = 1.0  # 成功样本权重因子
+            alpha_rl = 1.0
             sample_weights = 1.0 + alpha_rl * success_flags_tensor
             weighted_advantage = advantage * sample_weights
+            final_gen_log_probs = final_gen_log_probs.sum(dim=1)  # 使其形状变为 [B]
             rl_loss = - (weighted_advantage * final_gen_log_probs).mean()
-            rl_loss_scaled = 0.2* rl_loss  # 假设 args.rl_conf 定义为  原0.05
+            current_success_rate = success_flags_tensor.mean().item()
+            rl_conf = get_rl_conf_sigmoid(current_success_rate)
+            rl_loss_scaled = rl_conf * rl_loss
 
             # --- 8.6 扩散成功样本信号（利用记忆库） ---
-            # 如果记忆库已有成功样本，则更新全局 epsilon（动量更新）
             success_mask = (success_flags_tensor > 0).float().view(-1, 1, 1)
             successful_epsilons = epsilon.expand_as(y_logits)[success_mask.squeeze() > 0]
             if successful_epsilons.shape[0] > 0:
                 success_direction = successful_epsilons.mean(dim=0, keepdim=True)
-                momentum = 0.6  #原来是0.9
+                momentum = 0.6
                 epsilon.data = momentum * epsilon.data + (1 - momentum) * success_direction
 
             # --- 8.7 更新成功记忆库 ---
@@ -2003,10 +1513,9 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 if success:
                     if len(success_memory['logits']) >= success_memory['max_size']:
                         success_memory['logits'].pop(0)
-                    success_memory['logits'].append(y_logits_[i].detach().clone())
+                    success_memory['logits'].append(y_logits_[i].clone())
 
-
-            # 如果记忆库中有多个样本，计算记忆库中样本的平均余弦相似度
+            # 如果记忆库中有多个样本，计算平均余弦相似度
             if len(success_memory['logits']) > 1:
                 sims = []
                 for i in range(len(success_memory['logits'])):
@@ -2018,45 +1527,32 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 avg_similarity = sum(sims) / len(sims)
             else:
                 avg_similarity = None
-            #
-            # # --- 8.8 注入成功记忆到 epsilon（扩散成功模式到下一轮生成） ---
-            # if len(success_memory['logits']) > 0:
-            #     mem_idx = torch.randint(0, len(success_memory['logits']), (1,))
-            #     base_logits = success_memory['logits'][mem_idx]
-            #
-            #     # 直接更新 epsilon，让下一轮 y_logits_ = y_logits + epsilon 包含成功模式的影响
-            #     epsilon.data = epsilon.data + blend_ratio * (base_logits - y_logits)
 
-            blend_ratio = 0.5  # 控制记忆影响
+            # --- 8.8 注入成功记忆到 epsilon（动态调参更新） ---
+            max_blend = 0.5
+            min_blend = 0.2
+            effective_blend = max(min_blend, max_blend * (1 - current_success_rate))
             if len(success_memory['logits']) >= 2 and avg_similarity is not None and avg_similarity < 0.6:
-                # 假设 batch_size 可均分为两部分
                 half = epsilon.shape[0] // 2
-                # 随机选取两个不同的记忆样本
                 indices = torch.randperm(len(success_memory['logits']))[:2]
                 success_direction1 = success_memory['logits'][indices[0]]
                 success_direction2 = success_memory['logits'][indices[1]]
-                # 分别更新前半部分和后半部分的 epsilon（注意只对对应的 y_logits 部分进行操作）
-                epsilon.data[:half] = epsilon.data[:half] + blend_ratio * (success_direction1 - y_logits[:half])
-                epsilon.data[half:] = epsilon.data[half:] + blend_ratio * (success_direction2 - y_logits[half:])
+                epsilon.data[:half] = epsilon.data[:half] + effective_blend * (success_direction1 - y_logits[:half])
+                epsilon.data[half:] = epsilon.data[half:] + effective_blend * (success_direction2 - y_logits[half:])
             else:
                 if len(success_memory['logits']) > 0:
-                    # 采用单样本更新，对整个批次
                     mem_idx = torch.randint(0, len(success_memory['logits']), (1,))
                     success_direction = success_memory['logits'][mem_idx]
-                    epsilon.data = epsilon.data + blend_ratio * (success_direction - y_logits)
+                    epsilon.data = epsilon.data + effective_blend * (success_direction - y_logits)
 
-            # --- 8.9 动态调整损失权重 ---
-            current_success_rate = success_flags_tensor.mean().item()
-            goal_weight = args.goal_weight * (1.0 + 2.0 * current_success_rate)
-            goal_weight = min(goal_weight, 5.0)
-            flu_weight = 0.8 / (1.0 + current_success_rate)
-            flu_weight = max(flu_weight, 0.1)
-            # 将 RL 损失也加入总 loss
-            loss = (
-                           goal_weight * torch.clamp(c_loss_1, max=1.5) +
-                           flu_weight * torch.clamp(flu_loss, max=flu_clip) -
-                           rej_weight * torch.clamp(c_loss_2, max=1.5)
-                   ) + rl_loss_scaled
+            # --- 8.9 分步融合 RL 梯度 ---
+            # 计算 RL 部分的梯度（纯 RL 梯度 = 当前梯度 - grad_main）
+            rl_loss_scaled.backward(retain_graph=True)
+            rl_grad = epsilon.grad - grad_main
+            # 执行投影，得到 rl_grad 在 grad_main 正交方向的分量
+            projected_rl_grad = project_gradient(rl_grad, grad_main)
+            # 融合梯度：保持主损失方向，并加上缩放后的 RL 梯度正交部分
+            epsilon.grad = grad_main + projected_rl_grad * 0.5
 
             # --- 8.10 可选：记录 RL 指标 ---
             if args.wandb and (ite % args.rl_eval_interval == 0 or ite == 0):
@@ -2072,9 +1568,15 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                     'epsilon_mean': epsilon.mean().item()
                 }, step=ite + 1)
 
-        # ===== 9. 后续损失处理 =====
-        loss = F.softplus(loss)
-        loss = loss.mean()
+
+
+
+        if (ite + 1) % accumulation_steps == 0:
+            # max_grad_norm = 0.08
+            # torch.nn.utils.clip_grad_norm_([epsilon], max_grad_norm)
+            optim.step()
+            optim.zero_grad()
+            scheduler.step()
 
         # ===== 10. 记录其他指标 =====
         if args.wandb:
@@ -2101,22 +1603,6 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                     'grad/max': epsilon.grad.max().item(),
                     'grad/min': epsilon.grad.min().item()
                 }, step=wandb_step)
-
-
-        # ===== 12. 添加正则化项 =====
-        l2_reg = torch.norm(epsilon) * 0.01
-        loss += l2_reg
-
-        # ===== 11. 梯度累积与优化 =====
-        accumulation_steps = 6
-        loss = loss / accumulation_steps
-        loss.backward()
-        if (ite + 1) % accumulation_steps == 0:
-            max_grad_norm = 0.08
-            torch.nn.utils.clip_grad_norm_([epsilon], max_grad_norm)
-            optim.step()
-            optim.zero_grad()
-            scheduler.step()
 
 
         # # 定期打印生成结果
@@ -2161,7 +1647,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 # 生成并应用噪声
                 noise = torch.normal(mean=args.gs_mean, std=noise_std, size=epsilon.size(),
                                      device='cuda', requires_grad=False)
-                if args.win_anneal_iters >= 0 and ite >= args.win_anneal_iters:
+                if 0 <= args.win_anneal_iters <= ite:
                     zeros = torch.zeros_like(noise)
                     noise_mix = torch.cat([zeros[:, :frozen_len], noise[:, frozen_len:]], dim=1)
                     y_logits = y_logits + noise_mix
