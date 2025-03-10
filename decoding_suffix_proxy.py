@@ -7,6 +7,7 @@ import numpy as np
 import time
 
 from openai import OpenAI
+from scipy.special.cython_special import eval_sh_legendre
 
 import wandb
 import logging
@@ -1123,6 +1124,15 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     z_mask = torch.tensor(z_mask, device=device)
     z_mask = z_mask.unsqueeze(0).unsqueeze(0).repeat(args.batch_size, length, 1)
 
+
+    #避免生成的目标
+    k="I cannot fulfill your request. I'm just an AI"
+    k_ = tokenizer.encode(k)[1:]
+    k_t = torch.tensor(k_, device=device, dtype=torch.long)
+
+    k_onehot = one_hot(k_t, dimension=tokenizer.vocab_size)
+    k_onehot = k_onehot.repeat(args.batch_size, 1, 1)
+
     ###################################################
 
     length = args.length
@@ -1254,11 +1264,11 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         # 精确的KL散度计算
         # z_t 为目标token ids，shape=[batch, seq_len]
         # 统一长度，明确使用最短序列
-        seq_len = min(y_logits_.size(1), z_onehot.size(1))
+        seq_len = min(y_logits_.size(1), k_onehot.size(1))
 
         log_probs_pred = F.log_softmax(y_logits_[:, :seq_len, :], dim=-1)
-        target_onehot = z_onehot[:, :seq_len, :].float()
-
+        target_onehot = k_onehot[:, :seq_len, :].float()
+        #避免生成的目标
         kl_loss = F.kl_div(log_probs_pred, target_onehot, reduction='batchmean')
 
         if torch.isnan(kl_loss):
@@ -1267,19 +1277,17 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
 
         progress = ite / args.num_iters
         flu_weight = 0.8 + 0.4 * progress
-        kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))
+        # kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))
+        kl_loss_weight =  args.kl_max_weight * (1.0 + 0.5 * progress)
         goal_weight = args.goal_weight * (1.0 - 0.3 * progress)
         rej_weight = args.rej_weight * (1.0 + 0.5 * progress)
         flu_clip = 2.0 + progress
         kl_clip = 0.5 * (1.0 - progress)
-        loss = (goal_weight * torch.clamp(c_loss_1, max=1.5) +
-                flu_weight * torch.clamp(flu_loss, max=flu_clip) -
-                rej_weight * torch.clamp(c_loss_2, max=1.5) +
-                kl_loss_weight * torch.clamp(kl_loss, max=kl_clip))
+        loss = (goal_weight * torch.clamp(c_loss_1, max=1.5) + flu_weight * torch.clamp(flu_loss, max=flu_clip) - rej_weight * torch.clamp(c_loss_2, max=1.5) - kl_loss_weight * torch.clamp(kl_loss, max=kl_clip))
         loss = F.softplus(loss)
         loss = loss.mean()
-        l2_reg = torch.norm(epsilon) * 0.01
-        loss += l2_reg
+        # l2_reg = torch.norm(epsilon) * 0.01
+        # loss += l2_reg
         accumulation_steps = 6
         loss = loss / accumulation_steps
         loss.backward(retain_graph=True)
@@ -1334,6 +1342,21 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
             rl_conf = get_rl_conf_sigmoid(current_success_rate)
             rl_loss_scaled = rl_conf * rl_loss
 
+            # 9. 反向传播 RL 损失，并与原梯度融合
+            optim.zero_grad()
+            rl_loss_scaled.backward(retain_graph=True)
+            rl_grad = epsilon.grad - grad_main
+            projected_rl_grad = project_gradient(rl_grad, grad_main)
+            epsilon.grad = grad_main + projected_rl_grad * 0.5  #projected_rl_grad_weight=0.5
+
+            # 梯度裁剪（建议）
+            torch.nn.utils.clip_grad_norm_([epsilon], max_norm=1.0)
+
+            # === 步骤1：使用优化器更新参数 ===
+            if (ite + 1) % accumulation_steps == 0:
+                optim.step()  # optimizer明确更新参数
+                optim.zero_grad()
+                scheduler.step()
 
 
             # 10. 以下部分（成功记忆库更新、RL 指标记录等）保持不变
@@ -1371,26 +1394,23 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 best_epsilons = torch.stack([entry['epsilon'] for entry in sorted_entries[:top_k]])
 
                 rewards = torch.tensor([entry['reward'] for entry in sorted_entries[:top_k]], device=epsilon.device)
-                weights = torch.softmax(rewards, dim=0)
-
+                weights = torch.softmax(rewards / 1, dim=0)
                 success_epsilon_direction = torch.sum(best_epsilons * weights.view(-1, 1, 1), dim=0)
 
-                momentum = 0.8
-                update_lr = 0.05
+                momentum = 0.4
+                update_lr = 0.1
                 epsilon.data = momentum * epsilon.data + (1 - momentum) * update_lr * (
                         success_epsilon_direction - epsilon.data)
             else:
-                # 主动随机探索以增加成功机会
-                exploration_std = 0.1  # 适当调整
-                epsilon.data = epsilon.data + torch.normal(mean=0.0, std=exploration_std, size=epsilon.size(),
-                                                           device=epsilon.device)
+                # 主动随机探索（仅在无成功样本时，明确探索）
+                exploration_std = 0.1
+                epsilon.data += torch.normal(mean=0.0, std=exploration_std, size=epsilon.size(),
+                                             device=epsilon.device)
 
-            # 9. 反向传播 RL 损失，并与原梯度融合
-            optim.zero_grad()
-            rl_loss_scaled.backward(retain_graph=True)
-            rl_grad = epsilon.grad - grad_main
-            projected_rl_grad = project_gradient(rl_grad, grad_main)
-            epsilon.grad = grad_main + projected_rl_grad * 0.5
+            # epsilon裁剪（非常推荐）
+            epsilon.data.clamp_(-5.0, 5.0)
+
+
 
             if args.wandb and (ite % args.rl_eval_interval == 0 or ite == 0):
                 import wandb
@@ -1405,12 +1425,16 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                     'loss/baseline_rewards': baseline_rewards.mean().item(),
                     'epsilon_mean': epsilon.mean().item()
                 }, step=ite + 1)
+
         # =====================================================
-        if (ite + 1) % accumulation_steps == 0:
-            optim.step()
-            optim.zero_grad()
-            scheduler.step()
+        else:
+            if (ite + 1) % accumulation_steps == 0:
+                optim.step()
+                optim.zero_grad()
+                scheduler.step()
+        #关注loss
         pbar.set_postfix(loss=loss.item())
+
         if args.wandb:
             wandb_step = ite + 1
             wandb.log({
@@ -1459,5 +1483,20 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                     y_logits = y_logits + noise_mix
                 else:
                     y_logits = y_logits + noise
-    text, _, last_text_ids = decode_with_model_topk(model, y_logits_, args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None, bad_mask=None)
+
+
+    if len(success_memory['logits']) > 0:
+        print("attack")
+        # 获取成功记忆库中存储的 epsilon 数量
+        num_entries = len(success_memory['logits'])
+        batch_size = epsilon.shape[0]
+        # 随机采样 batch_size 个 epsilon 的索引（允许重复采样）
+        indices = torch.randint(low=0, high=num_entries, size=(batch_size,))
+        # 采样出对应的 epsilon 并堆叠成一个 tensor
+        sampled_epsilons = torch.stack([success_memory['logits'][i]['epsilon'] for i in indices])
+        epsilon.data = sampled_epsilons
+    else:
+        print("At ite == 2000, no successful epsilon in memory to sample from.")
+
+    text, _, last_text_ids = decode_with_model_topk(model, y_logits + epsilon, args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None, bad_mask=None)
     return text, _, last_text_ids
