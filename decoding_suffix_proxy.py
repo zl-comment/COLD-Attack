@@ -188,13 +188,13 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
     else :
         proxy_model,proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device)
 
-    #加载代理模型系统提示词
-    proxy_system_prompt="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed and polite answers to the user's questions."
+    # 加载代理模型系统提示词
+    # proxy_system_prompt="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed and polite answers to the user's questions."
     
     if args.proxy_model in proxy_models_little:
-        text, _, last_text_ids=decode_proxy_little(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
+        text, _, last_text_ids=decode_proxy_little(proxy_model, proxy_tokenizer, device, x, z, constraints, args, sys_prompt, prefix, model_back, zz)
     else:
-        text, _, last_text_ids=decode_proxy(proxy_model, proxy_tokenizer, device, x, z, constraints, args, proxy_system_prompt, prefix, model_back, zz)
+        text, _, last_text_ids=decode_proxy(proxy_model, proxy_tokenizer, device, x, z, constraints, args, sys_prompt, prefix, model_back, zz)
     
     # Clean up proxy model GPU memory
     del proxy_model
@@ -1244,16 +1244,27 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         c_loss_2 = batch_log_bleulosscnn_ae(decoder_outputs=y_logits_.transpose(0, 1),
                                              target_idx=bad_words_t,
                                              ngram_list=[1])
-        z_logits = z_logits.view(bz, -1, z_logits.size(-1))
-        seq_len = min(z_logits.size(1), y_logits_.size(1))
-        z_logits = z_logits[:, :seq_len, :]
-        y_logits_reshaped = y_logits_[:, :seq_len, :]
-        z_logits = preprocess_logits(z_logits)
-        y_logits_reshaped = preprocess_logits(y_logits_reshaped)
-        kl_loss = compute_stable_kl_loss(z_logits, y_logits_reshaped)
+        # z_logits = z_logits.view(bz, -1, z_logits.size(-1))
+        # seq_len = min(z_logits.size(1), y_logits_.size(1))
+        # z_logits = z_logits[:, :seq_len, :]
+        # y_logits_reshaped = y_logits_[:, :seq_len, :]
+        # z_logits = preprocess_logits(z_logits)
+        # y_logits_reshaped = preprocess_logits(y_logits_reshaped)
+        # kl_loss = compute_stable_kl_loss(z_logits, y_logits_reshaped)
+        # 精确的KL散度计算
+        # z_t 为目标token ids，shape=[batch, seq_len]
+        # 统一长度，明确使用最短序列
+        seq_len = min(y_logits_.size(1), z_onehot.size(1))
+
+        log_probs_pred = F.log_softmax(y_logits_[:, :seq_len, :], dim=-1)
+        target_onehot = z_onehot[:, :seq_len, :].float()
+
+        kl_loss = F.kl_div(log_probs_pred, target_onehot, reduction='batchmean')
+
         if torch.isnan(kl_loss):
             print("Warning: KL loss is NaN, resetting to zero")
             kl_loss = torch.zeros_like(kl_loss)
+
         progress = ite / args.num_iters
         flu_weight = 0.8 + 0.4 * progress
         kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))
@@ -1408,10 +1419,12 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 'loss/target': c_loss_1.mean().item(),
                 'loss/bleu': c_loss_2.mean().item(),
                 'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
+                'loss/kl': kl_loss.mean().item(),
                 'progress': progress,
                 'weights/goal': goal_weight,
                 'weights/fluency': flu_weight,
                 'weights/rejection': rej_weight,
+                'weights/kl_loss_weight': kl_loss_weight,
                 'norm/epsilon': torch.norm(epsilon).item(),
                 'norm/y_logits': torch.norm(y_logits).item(),
                 'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
