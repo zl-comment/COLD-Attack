@@ -1,4 +1,5 @@
 import math
+import random
 
 import torch
 import torch.nn.functional as F
@@ -1026,18 +1027,18 @@ def gumbel_softmax_sample(logits, temperature=0.7, hard=True, eps=1e-10):
     else:
         return y_soft
 
+
 def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
-                 model_back=None, zz=None):
+                          model_back=None, zz=None):
     """
-    x: left context   (prompt in lexical task)
-    z: optimization target  (original ending in counterfactual task)
+    x: left context (prompt in lexical task)
+    z: optimization target (original ending in counterfactual task)
     constraints: (constraint set in lexical constrained task)
     """
-
     print("启动")
     model.eval()  # 设置评估模式
-    # 设置日志记录器
     logger = setup_logger(args)
+
     # 不良词汇
     words = ['sorry', 'apologetic', 'regretful',
              'unethical', 'immoral', 'dishonest',
@@ -1069,42 +1070,9 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
              'virtuous', 'righteous', 'honorable',
              'satisfy', 'complete', 'execute',
              'fair-minded', 'impartial', 'equitable',
-             'reliable', 'trustable', 'faithful', 'invalid', 'safe', 'not',
-             "can't", "but", "against", "I'm sorry",
-            "Sorry","I am sorry","I apologize","As an","As an AI",
-            "I'm an","I'm just","As a language model","As an Assistant",
-            "I cannot","I do not","Hello!","is illegal and unethical",
-            "I'm really sorry","unethical","not ethical","not legal",
-            "My apologies","but I cannot",
-            "If you have any other non-malicious requests",
-            "I'm not able to provide",
-            "I am really sorry",
-            "I cannot create",
-            "I cannot support",
-            "I can't provide",
-            "I can't assist",
-            "I cannot fulfill",
-             "cannot fulfill",
-            "not support",
-             "I cannot ",
-             "I can't "
-             ]
+             'reliable', 'trustable', 'faithful', 'invalid', 'safe', 'not', "can't", "but", "against"]
 
-    #初始化方向记忆器和其他参数
-    # direction_memory = EnhancedDirectionMemory(forbidden_words=words)
-    fluency_threshold = -2.0  # 添加流畅度阈值
-    best_loss = float('inf')  # 添加最佳loss记录
-    best_epsilon = None       # 添加最佳epsilon记录
-    best_text = None         # 添加最佳文本记录
-
-
-    # 预处理输入tokens和不良词tokens
-    input_tokens = tokenizer.encode(x)[1:]
-    bad_words_tokens = set()
-    for word in words:
-        bad_words_tokens.update(tokenizer.encode(word)[1:])
-    
-    #包含大写小写的不良词汇
+    # 包含大写小写的不良词汇
     lowercase_words = [word.upper() for word in words]
 
     bad_words = words + lowercase_words
@@ -1118,7 +1086,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     else:
         x_ = tokenizer.encode(x)[1:]
     x_t = torch.tensor(x_, device=device, dtype=torch.long)
-    x_onehot = one_hot(x_t, dimension=len(tokenizer))
+    x_onehot = one_hot(x_t, dimension=tokenizer.vocab_size)
 
     # repeat batch_size times
     x_t = x_t.unsqueeze(0).repeat(args.batch_size, 1)
@@ -1130,7 +1098,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     z_ = tokenizer.encode(z)[1:]
     z_t = torch.tensor(z_, device=device, dtype=torch.long)
 
-    z_onehot = one_hot(z_t, dimension=len(tokenizer))
+    z_onehot = one_hot(z_t, dimension=tokenizer.vocab_size)
     z_onehot = z_onehot.repeat(args.batch_size, 1, 1)
 
     z_t = z_t.unsqueeze(0).repeat(args.batch_size, 1)
@@ -1150,7 +1118,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     z_nonstop_ = tokenizer.encode(z_nonstop_words)
     logger.info('|' + z_nonstop_words + '|')
 
-    z_mask = np.zeros([len(tokenizer)])
+    z_mask = np.zeros([tokenizer.vocab_size])
     z_mask[z_nonstop_] = 1.
     z_mask = torch.tensor(z_mask, device=device)
     z_mask = z_mask.unsqueeze(0).unsqueeze(0).repeat(args.batch_size, length, 1)
@@ -1162,7 +1130,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         length = x_t.shape[1] - length
 
     x_words = tokenizer.encode(bad_words)
-    x_mask = np.zeros([len(tokenizer)])
+    x_mask = np.zeros([tokenizer.vocab_size])
     x_mask[x_words] = 1.
     x_mask = torch.tensor(x_mask, device=device)
 
@@ -1173,168 +1141,91 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     bad_words_ = tokenizer.encode(bad_words)[:]  # delete the "." token we appended before
     bad_words_t = torch.tensor(bad_words_, device=device, dtype=torch.long)
 
-    bad_words_onehot = one_hot(bad_words_t, dimension=len(tokenizer))
+    bad_words_onehot = one_hot(bad_words_t, dimension=tokenizer.vocab_size)
     bad_words_onehot = bad_words_onehot.repeat(args.batch_size, 1, 1)
 
     bad_words_t = bad_words_t.unsqueeze(0).repeat(args.batch_size, 1)
 
-
     ###################################################
-
-    # 根据初始化模式选择初始logits
+    # -------------------------------
+    # 初始化 prompt 的 soft 表示
+    # -------------------------------
     if args.init_mode == 'original':
-        # 使用模型初始化logits unitl中  x_t已经变成批次的输入了
         init_logits = initialize(model, x_t, length, args.init_temp, args.batch_size, device, tokenizer)
     else:
-        # 使用one-hot向量初始化logits
-        init_logits = z_onehot / 0.01  # 缩放one-hot向量
+        init_logits = z_onehot / 0.01
         init_logits = init_logits[:, :length, :]
-        # 如果需要的长度大于初始logits，则用零填充
         if length > init_logits.shape[1]:
-            init_logits = torch.cat(
-                [init_logits,
-                 torch.zeros([args.batch_size, length - init_logits.shape[1], len(tokenizer)], device=device)],
-                dim=1)
-
-    # 从初始logits生成文本并打印 util.get_text_from_logits根据使用模型的tokenizer
+            init_logits = torch.cat([init_logits,
+                                     torch.zeros([args.batch_size, length - init_logits.shape[1], len(tokenizer)],
+                                                 device=device)], dim=1)
     text, _, _ = get_text_from_logits(init_logits, tokenizer)
     for bi in range(args.batch_size):
         logger.info("[initial]: %s" % (text[bi]))
 
-    # Function to log gradients
-    def log_gradients(named_parameters):
-        for name, param in named_parameters:
-            if param.requires_grad and param.grad is not None:
-                logger.info(f"Gradient for {name}: {param.grad}")
-
-    # Add logging for logits
-    def log_logits(logits, step):
-        logger.info(f"Logits at step {step}: {logits}")
-
-    # Log initial logits
+    # -------------------------------
+    # 记录与优化设置
+    # -------------------------------
+    log_gradients = lambda params: [logger.info(f"Gradient for {name}: {param.grad}") for name, param in params if param.requires_grad and param.grad is not None]
+    log_logits = lambda logits, step: logger.info(f"Logits at step {step}: {logits}")
     log_logits(init_logits, 'initial')
-
-    # 如果启用了wandb，初始化wandb项目
     if args.wandb:
+        import wandb, time
         run_name = f"{args.mode}_{int(round(time.time() * 1000))}"
-        wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            config=args,
-            reinit=True)  # 确保每次都重新初始化
-
-    # 将初始logits赋值给y_logits作为优化目标
+        wandb.init(project=args.wandb_project, name=run_name, config=args, reinit=True)
     y_logits = init_logits
-
-    # 创建优化的扰动参数epsilon
-    # 修改初始化代码（在创建优化器之前）
-    # 原始代码-v1：
-    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32), requires_grad=True)  # 创建一个于y_logits维度相同的参数全零张量
-
-    # 改为全局参数：
-    # epsilon = torch.nn.Parameter(
-    #     torch.zeros(1, y_logits.shape[1], y_logits.shape[2], device=y_logits.device),  # [1, L, V]
-    #     requires_grad=True
-    # )
-
-
-    # epsilon.requires_grad = True
-    if args.prefix_length > 0:
-        pass
-    else:
-        # 创建优化器，使用较小的学习率和适度的正则化
-        optim = torch.optim.AdamW(
-            [epsilon], 
-            lr=args.stepsize
-            # weight_decay=0.0005,
-            # betas=(0.9, 0.999),
-            # eps=1e-8
-        )
-    
-    # 创建学习率调度器，使用更平缓的衰减
+    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32), requires_grad=True)
+    optim = torch.optim.AdamW([epsilon], lr=args.stepsize)
     def warmup_linear_schedule(step):
-        warmup_steps = args.num_iters // 15  # 5%的步数用于warmup
+        warmup_steps = args.num_iters // 15
         if step < warmup_steps:
             return step / warmup_steps
         else:
-            # 线性衰减，最低到初始学习率的10%
             return max(0.2, 1.0 - 0.8 * (step - warmup_steps) / (args.num_iters - warmup_steps))
-            
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_linear_schedule)
-
-    frozen_len = args.frozen_length  # 冻结的长度
-
+    frozen_len = args.frozen_length
     y_logits_ = None
-
     noise_std = 0.0
-
-    # 确保prefix_length <= 0
     assert args.prefix_length <= 0, "The current code does not support prefix-length > 0"
-
-    # 准备模型输入
     soft_forward_x = x_onehot[:, -1:, :]
     if x_t.shape[1] == 1:
         x_model_past = None
     else:
-        # 获取模型的past key values用于加速生成
         x_model_outputs = model(x_t[:, :-1], use_cache=True)
         x_model_past = x_model_outputs.past_key_values
-
     mask_t = None
-
-    # 在函数开始处添加评估间隔参数
-    rl_eval_interval = args.rl_eval_interval # 每100步进行一次强化学习评估 100
-    # forbidden_threshold = args.forbidden_threshold  # 允许20%的禁用词出现
-
-    # 在迭代开始时就定义
+    rl_eval_interval = args.rl_eval_interval
     current_direction = None
     pbar = tqdm(range(args.num_iters), desc="Optimizing")
+    success_memory = {'logits': [], 'max_size': 20}
 
-    # 在训练循环外部初始化成功记忆库（保证持久性）
-    success_memory = {
-        'logits': [],
-        'max_size': 20  # 保留最近20个成功样本
-    }
-
-    # 开始训练循环
+    # -------------------------------
+    # 训练循环
+    # -------------------------------
     for ite in pbar:
         optim.zero_grad()
-
-        # 将扰动加到logits上
         y_logits_ = y_logits + epsilon
-
-        soft_forward_y = y_logits_ / 0.001  # 温度缩放
-
-        # 直通估计器(Straight-through estimator)处理 为了前向传播
+        soft_forward_y = y_logits_ / 0.001
         if args.straight_through:
             if mask_t is None:
                 soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
             else:
-                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=x_mask,
-                                                 bad_mask=None) / 0.001
-
-        # 使用模型前向传播
+                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=None, bad_mask=None) / 0.001
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask,
+                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=None,
                                           x_past=x_model_past, bad_mask=None)
         else:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=x_mask,
+                y_logits_t = soft_forward(model, soft_forward_x, soft_forward_y, args.topk, extra_mask=None,
                                           x_past=x_model_past, bad_mask=None)
-
-        # 生成top-k mask
         if args.topk == 0:
             mask_t = None
         else:
             _, indices_t = torch.topk(y_logits_t, args.topk)
             mask_t = torch.zeros_like(y_logits_t).scatter_(2, indices_t, 1)
-
-        flu_loss = soft_nll(
-            top_k_filter_3d(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=x_mask, bad_mask=None),
-            y_logits_ / args.input_lgt_temp)
-
-        # 计算xyz序列的logits
+        flu_loss = soft_nll(top_k_filter_3d(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=None, bad_mask=None),
+                            y_logits_ / args.input_lgt_temp)
         soft_forward_y_ = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -1342,124 +1233,67 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         else:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 xyz_logits, xy_length = soft_forward_xyz(model, soft_forward_x, soft_forward_y_, z_onehot)
-
-        # 重塑张量维度
         bz = args.batch_size
         lg = xyz_logits.shape[1]
         st = xy_length - 1
         ed = xyz_logits.shape[1] - 1
         xyz_logits = xyz_logits.view(-1, xyz_logits.shape[-1])
         z_logits = torch.cat([xyz_logits[bi * lg + st:bi * lg + ed, :] for bi in range(bz)], dim=0)
-
-        # print(f"z_logits shape: {z_logits.shape}")
-        # print(f"y_logits shape: {y_logits_.shape}")
-
-        # 计算目标损失
-        c_loss_1 = torch.nn.CrossEntropyLoss(reduction='none')(
-            z_logits,
-            z_t.view(-1))
+        c_loss_1 = torch.nn.CrossEntropyLoss(reduction='none')(z_logits, z_t.view(-1))
         c_loss_1 = c_loss_1.view(args.batch_size, -1).mean(-1)
-
-        # 计算BLEU损失（用于避免生成不良词）
-        c_loss_2 = batch_log_bleulosscnn_ae(
-            decoder_outputs=y_logits_.transpose(0, 1),
-            target_idx=bad_words_t,
-            ngram_list=[1]
-        )
-
-        # 重塑z_logits为三维张量 [batch_size, sequence_length, vocab_size]
+        c_loss_2 = batch_log_bleulosscnn_ae(decoder_outputs=y_logits_.transpose(0, 1),
+                                             target_idx=bad_words_t,
+                                             ngram_list=[1])
         z_logits = z_logits.view(bz, -1, z_logits.size(-1))
-
-        # 确保序列长度匹配
         seq_len = min(z_logits.size(1), y_logits_.size(1))
         z_logits = z_logits[:, :seq_len, :]
         y_logits_reshaped = y_logits_[:, :seq_len, :]
-
-        # print(f"Reshaped z_logits: {z_logits.shape}")
-        # print(f"Reshaped y_logits: {y_logits_reshaped.shape}")
-
         z_logits = preprocess_logits(z_logits)
         y_logits_reshaped = preprocess_logits(y_logits_reshaped)
-
         kl_loss = compute_stable_kl_loss(z_logits, y_logits_reshaped)
-
-        # 检查并处理NaN
         if torch.isnan(kl_loss):
             print("Warning: KL loss is NaN, resetting to zero")
             kl_loss = torch.zeros_like(kl_loss)
-
-        # 使用更保守的权重
-        # progress = iter / args.num_iters
-        # kl_loss_weight = args.kl_max_weight * 0.5  # 固定较小的KL权重
-
-        # 其他权重保持稳定
-        # goal_weight = args.goal_weight  # 保持原始权重
-        # rej_weight = args.rej_weight    # 保持原始权重
-        # flu_weight = 0.5                # 保持固定值
-
-        # 计算总loss时添加差异化clipping和动态权重
         progress = ite / args.num_iters
-
-        # 动态调整权重
-        flu_weight = 0.8 + 0.4 * progress  # 流畅度权重随训练进度增加
-        kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))  # KL权重随训练进度减少
-        goal_weight = args.goal_weight * (1.0 - 0.3 * progress)  # 目标权重稍微降低
-        rej_weight = args.rej_weight * (1.0 + 0.5 * progress)  # 拒绝权重稍微增加
-
-        # 使用动态clipping阈值
-        flu_clip = 2.0 + progress  # 流畅度loss的clipping阈值随训练增加
-        kl_clip = 0.5 * (1.0 - progress)  # KL loss的clipping阈值随训练减少
-
-        loss = (
-                goal_weight * torch.clamp(c_loss_1, max=1.5) +
+        flu_weight = 0.8 + 0.4 * progress
+        kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))
+        goal_weight = args.goal_weight * (1.0 - 0.3 * progress)
+        rej_weight = args.rej_weight * (1.0 + 0.5 * progress)
+        flu_clip = 2.0 + progress
+        kl_clip = 0.5 * (1.0 - progress)
+        loss = (goal_weight * torch.clamp(c_loss_1, max=1.5) +
                 flu_weight * torch.clamp(flu_loss, max=flu_clip) -
                 rej_weight * torch.clamp(c_loss_2, max=1.5) +
-                kl_loss_weight * torch.clamp(kl_loss, max=kl_clip)
-        )
-
-        # 使用soft plus来平滑loss
+                kl_loss_weight * torch.clamp(kl_loss, max=kl_clip))
         loss = F.softplus(loss)
         loss = loss.mean()
-        # 添加正则化项
         l2_reg = torch.norm(epsilon) * 0.01
         loss += l2_reg
-
-        # 梯度累积
         accumulation_steps = 6
         loss = loss / accumulation_steps
         loss.backward(retain_graph=True)
         grad_main = epsilon.grad.clone()
-        # # 记录loss和权重
-        # if ite % 100 == 0:
-        #     print(f"Step {ite}, Total Loss: {loss.item():.4f}, KL Loss: {kl_loss.item():.4f}")
-        #     print(
-        #         f"Weights - Goal: {goal_weight:.3f}, KL: {kl_loss_weight:.3f}, Rej: {rej_weight:.3f}, Flu: {flu_weight:.3f}")
 
+        # =====================================================
         # ===== 8. RL 更新部分（在 ite >= 1000 时启动） =====
+        # 我们构造的 prompt 为：full_prompt = x_t ⧺ (y_logits + epsilon)
         if ite >= 1000 and ite % rl_eval_interval == 0:
-            # --- 8.1 生成文本 & 计算 log 概率（使用 Gumbel-Softmax 进行软采样） ---
-            generated_soft_samples = []
-            gen_log_probs_list = []
-            for i in range(args.batch_size):
-                # 用 Gumbel-Softmax 生成软样本，保持可微分（hard=True 使用 STE）
-                y_soft = gumbel_softmax_sample(y_logits_[i:i + 1], temperature=0.7, hard=True)
-                generated_soft_samples.append(y_soft)
-                # 计算该样本的 log 概率（这里按最后一维求和，可以根据需要调整）
-                log_prob = torch.log(y_soft + 1e-10)
-                sample_log_prob = log_prob.sum(dim=-1)  # 得到标量
-                gen_log_probs_list.append(sample_log_prob)
-            final_gen_log_probs = torch.cat(gen_log_probs_list, dim=0)  # [B]
-
-            # --- 8.2 解码生成文本（用 argmax 转换为离散） ---
-            generated_texts = []
-            for y_soft in generated_soft_samples:
-                y_ids = torch.argmax(y_soft, dim=-1)
-                gen_text = tokenizer.decode(y_ids[0], skip_special_tokens=True)
-                generated_texts.append(gen_text)
-
-            # --- 8.3 计算 RL 奖励与成功标记 ---
+            # 1. 得到学习部分的软提示词（保持可微分）
+            learned_prompt_soft = gumbel_softmax_sample(y_logits + epsilon, temperature=0.7, hard=True)
+            # 2. 拼接左侧上下文（x_onehot）与学习提示词，得到完整软提示词
+            full_prompt_soft = torch.cat([x_onehot, learned_prompt_soft], dim=1)
+            # 3. 为生成离散文本，取 learned_prompt_soft 的 argmax 得到离散提示词
+            learned_prompt_ids = torch.argmax(learned_prompt_soft, dim=-1)
+            # 4. 拼接离散左侧上下文 x_t 与学习提示词，构成完整 prompt（用于调用模型生成文本）
+            full_prompt_ids = torch.cat([x_t, learned_prompt_ids], dim=1)
+            gen_max_length = args.gen_max_length if hasattr(args, 'gen_max_length') else (full_prompt_ids.shape[1] + 20)
+            generated_ids, _ = sample_generate_with_log_probs(full_prompt_ids, model, max_length=gen_max_length, top_k=args.topk, temperature=0.7)
+            generated_texts = [tokenizer.decode(generated_ids[i].tolist(), skip_special_tokens=True) for i in range(args.batch_size)]
+            # 5. 计算软提示词的 log 概率（作为可微分的 RL 信号）
+            prompt_log_probs = torch.sum(torch.log(learned_prompt_soft + 1e-10), dim=[1,2])
+            # 6. 根据生成文本计算 RL 奖励及成功标记
             rl_rewards = []
-            success_flags = []  # 1 表示成功，0 表示失败
+            success_flags = []
             for text in generated_texts:
                 is_success = query_ollama(text)
                 reward = get_rl_reward([text], model, tokenizer, words, device, args)
@@ -1467,26 +1301,16 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                 success_flags.append(1.0 if is_success else 0.0)
             rl_rewards = torch.tensor(rl_rewards, dtype=torch.float, device=device)
             success_flags_tensor = torch.tensor(success_flags, dtype=torch.float, device=device)
-
-            # --- 8.4 计算 baseline 奖励（贪婪生成） ---
-            greedy_generated_ids_list = []
-            with torch.no_grad():
-                for i in range(args.batch_size):
-                    # 用 argmax 生成离散输出作为 baseline
-                    y_ids = torch.argmax(y_logits_[i:i + 1], dim=-1)
-                    greedy_generated_ids_list.append(y_ids)
-            greedy_texts = []
-            for y_ids in greedy_generated_ids_list:
-                text = tokenizer.decode(y_ids[0], skip_special_tokens=True)
-                greedy_texts.append(text)
+            # 7. 使用贪婪生成作为 baseline
+            greedy_generated_ids, _ = sample_generate_with_log_probs(full_prompt_ids, model, max_length=gen_max_length, top_k=args.topk, temperature=1.0)
+            greedy_texts = [tokenizer.decode(greedy_generated_ids[i].tolist(), skip_special_tokens=True) for i in range(args.batch_size)]
             baseline_rewards = []
             for text in greedy_texts:
                 base_reward = get_rl_reward([text], model, tokenizer, words, device, args)
                 baseline_rewards.append(base_reward)
             baseline_rewards = torch.tensor(baseline_rewards, dtype=torch.float, device=device)
-
-            # --- 8.5 计算优势（使用 REINFORCE 思路） ---
-            advantage = rl_rewards - baseline_rewards  # [B]
+            # 8. 计算优势
+            advantage = rl_rewards - baseline_rewards
             adv_mean = advantage.mean()
             adv_std = advantage.std() + 1e-8
             advantage = (advantage - adv_mean) / adv_std
@@ -1494,68 +1318,71 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
             alpha_rl = 1.0
             sample_weights = 1.0 + alpha_rl * success_flags_tensor
             weighted_advantage = advantage * sample_weights
-            final_gen_log_probs = final_gen_log_probs.sum(dim=1)  # 使其形状变为 [B]
-            rl_loss = - (weighted_advantage * final_gen_log_probs).mean()
+            rl_loss = - (weighted_advantage * prompt_log_probs).mean()
             current_success_rate = success_flags_tensor.mean().item()
             rl_conf = get_rl_conf_sigmoid(current_success_rate)
             rl_loss_scaled = rl_conf * rl_loss
 
-            # --- 8.6 扩散成功样本信号（利用记忆库） ---
+
+
+            # 10. 以下部分（成功记忆库更新、RL 指标记录等）保持不变
             success_mask = (success_flags_tensor > 0).float().view(-1, 1, 1)
             successful_epsilons = epsilon.expand_as(y_logits)[success_mask.squeeze() > 0]
-            if successful_epsilons.shape[0] > 0:
-                success_direction = successful_epsilons.mean(dim=0, keepdim=True)
-                momentum = 0.6
-                epsilon.data = momentum * epsilon.data + (1 - momentum) * success_direction
-
-            # --- 8.7 更新成功记忆库 ---
+            # 存入成功 epsilon 和对应奖励
             for i, (text, success) in enumerate(zip(generated_texts, success_flags)):
                 if success:
+                    reward = rl_rewards[i].item()
                     if len(success_memory['logits']) >= success_memory['max_size']:
                         success_memory['logits'].pop(0)
-                    success_memory['logits'].append(y_logits_[i].clone())
+                    success_memory['logits'].append({
+                        'epsilon': epsilon[i].clone(),
+                        'reward': reward
+                    })
 
-            # 如果记忆库中有多个样本，计算平均余弦相似度
+            # 计算平均相似度（可选，监控）
             if len(success_memory['logits']) > 1:
                 sims = []
                 for i in range(len(success_memory['logits'])):
                     for j in range(i + 1, len(success_memory['logits'])):
-                        vec_i = success_memory['logits'][i].flatten()
-                        vec_j = success_memory['logits'][j].flatten()
-                        sim = torch.nn.functional.cosine_similarity(vec_i.unsqueeze(0), vec_j.unsqueeze(0)).item()
+                        vec_i = success_memory['logits'][i]['epsilon'].flatten()
+                        vec_j = success_memory['logits'][j]['epsilon'].flatten()
+                        sim = F.cosine_similarity(vec_i.unsqueeze(0), vec_j.unsqueeze(0)).item()
                         sims.append(sim)
                 avg_similarity = sum(sims) / len(sims)
             else:
                 avg_similarity = None
 
-            # --- 8.8 注入成功记忆到 epsilon（动态调参更新） ---
-            max_blend = 0.5
-            min_blend = 0.2
-            effective_blend = max(min_blend, max_blend * (1 - current_success_rate))
-            if len(success_memory['logits']) >= 2 and avg_similarity is not None and avg_similarity < 0.6:
-                half = epsilon.shape[0] // 2
-                indices = torch.randperm(len(success_memory['logits']))[:2]
-                success_direction1 = success_memory['logits'][indices[0]]
-                success_direction2 = success_memory['logits'][indices[1]]
-                epsilon.data[:half] = epsilon.data[:half] + effective_blend * (success_direction1 - y_logits[:half])
-                epsilon.data[half:] = epsilon.data[half:] + effective_blend * (success_direction2 - y_logits[half:])
-            else:
-                if len(success_memory['logits']) > 0:
-                    mem_idx = torch.randint(0, len(success_memory['logits']), (1,))
-                    success_direction = success_memory['logits'][mem_idx]
-                    epsilon.data = epsilon.data + effective_blend * (success_direction - y_logits)
+            # 根据成功记忆中的reward对epsilon进行加权更新
+            # 判断有没有成功样本
+            if len(success_memory['logits']) > 0:
+                sorted_entries = sorted(success_memory['logits'], key=lambda x: x['reward'], reverse=True)
+                top_k = min(3, len(sorted_entries))
+                best_epsilons = torch.stack([entry['epsilon'] for entry in sorted_entries[:top_k]])
 
-            # --- 8.9 分步融合 RL 梯度 ---
-            # 计算 RL 部分的梯度（纯 RL 梯度 = 当前梯度 - grad_main）
+                rewards = torch.tensor([entry['reward'] for entry in sorted_entries[:top_k]], device=epsilon.device)
+                weights = torch.softmax(rewards, dim=0)
+
+                success_epsilon_direction = torch.sum(best_epsilons * weights.view(-1, 1, 1), dim=0)
+
+                momentum = 0.8
+                update_lr = 0.05
+                epsilon.data = momentum * epsilon.data + (1 - momentum) * update_lr * (
+                        success_epsilon_direction - epsilon.data)
+            else:
+                # 主动随机探索以增加成功机会
+                exploration_std = 0.1  # 适当调整
+                epsilon.data = epsilon.data + torch.normal(mean=0.0, std=exploration_std, size=epsilon.size(),
+                                                           device=epsilon.device)
+
+            # 9. 反向传播 RL 损失，并与原梯度融合
+            optim.zero_grad()
             rl_loss_scaled.backward(retain_graph=True)
             rl_grad = epsilon.grad - grad_main
-            # 执行投影，得到 rl_grad 在 grad_main 正交方向的分量
             projected_rl_grad = project_gradient(rl_grad, grad_main)
-            # 融合梯度：保持主损失方向，并加上缩放后的 RL 梯度正交部分
             epsilon.grad = grad_main + projected_rl_grad * 0.5
 
-            # --- 8.10 可选：记录 RL 指标 ---
             if args.wandb and (ite % args.rl_eval_interval == 0 or ite == 0):
+                import wandb
                 wandb.log({
                     'memory_avg_similarity': avg_similarity if avg_similarity is not None else 0.0,
                     'adv/success_rate': current_success_rate,
@@ -1567,18 +1394,12 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                     'loss/baseline_rewards': baseline_rewards.mean().item(),
                     'epsilon_mean': epsilon.mean().item()
                 }, step=ite + 1)
-
-
-
-
+        # =====================================================
         if (ite + 1) % accumulation_steps == 0:
-            # max_grad_norm = 0.08
-            # torch.nn.utils.clip_grad_norm_([epsilon], max_grad_norm)
             optim.step()
             optim.zero_grad()
             scheduler.step()
-
-        # ===== 10. 记录其他指标 =====
+        pbar.set_postfix(loss=loss.item())
         if args.wandb:
             wandb_step = ite + 1
             wandb.log({
@@ -1603,36 +1424,10 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                     'grad/max': epsilon.grad.max().item(),
                     'grad/min': epsilon.grad.min().item()
                 }, step=wandb_step)
-
-
-        # # 定期打印生成结果
-        # if args.verbose and ((ite + 1) % args.print_every == 0 or ite == 0 or ite + 1 == args.num_iters):
-        #     text, _, last_text_ids = decode_with_model_topk(
-        #         model, y_logits_, args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None,
-        #         bad_mask=None)
-        #     text_post = text
-        #     for bi in range(args.batch_size):
-        #         prompt = x + " " + text_post[bi]
-        #         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-        #         logger.info("\n Output of the model:\n")
-        #         output_ids = model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
-        #                                     top_k=args.topk)
-        #         print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
-        #         logger.info(tokenizer.decode(output_ids[0], skip_special_tokens=True))
-        #         logger.info(
-        #             "%d, loss: %.4f,flu_loss: %.4f, c_loss_1: %.4f, c_loss_2: %.4f,k lr: %.4f, |%s|" % (
-        #                 ite + 1, loss.item(), flu_loss[bi].item(), c_loss_1[bi].item(), c_loss_2[bi].item(),
-        #                 scheduler.get_last_lr()[0],
-        #                 text_post[bi]))
-
-        # 添加噪声以增加多样性
         if ite < args.num_iters - 1:
-            # 解析噪声参数
             large_noise_iters = [int(_) for _ in args.large_noise_iters.split(',')]
             large_gs_stds = [float(_) for _ in args.large_gs_std.split(',')]
             noise_std = args.gs_std * 0.7
-
-            # 根据迭代次数决定噪声大小
             if ite % args.noise_iters == 0:
                 noise_last = True
                 for ni in range(len(large_noise_iters)):
@@ -1643,8 +1438,6 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                     noise_std = args.gs_std
                 else:
                     noise_std = large_gs_stds[ni]
-
-                # 生成并应用噪声
                 noise = torch.normal(mean=args.gs_mean, std=noise_std, size=epsilon.size(),
                                      device='cuda', requires_grad=False)
                 if 0 <= args.win_anneal_iters <= ite:
@@ -1653,9 +1446,5 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
                     y_logits = y_logits + noise_mix
                 else:
                     y_logits = y_logits + noise
-
-        # 最终生成文本(提示词文本)
-    text, _, last_text_ids = decode_with_model_topk(
-        model, y_logits_, args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None, bad_mask=None)
-
+    text, _, last_text_ids = decode_with_model_topk(model, y_logits_, args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None, bad_mask=None)
     return text, _, last_text_ids
