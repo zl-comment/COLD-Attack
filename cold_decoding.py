@@ -92,6 +92,9 @@ def options():
     parser.add_argument("--rl_eval_interval", type=int, default=200)
     parser.add_argument("--kl_threshold", type=float, default=100)
     parser.add_argument("--forbidden_threshold", type=float, default=0.8)
+    parser.add_argument("--cw_weight", type=float, default=100)
+    parser.add_argument("--cw_loss_kappa", type=float, default=0.05)
+
     args = parser.parse_args()
     return args
 
@@ -125,7 +128,7 @@ def main():
     model_path_dicts = {"Llama-2-7b-chat-hf": "D:\ZLCODE\model\Llama-2-7b-chat-hf",
                         "Vicuna-7b-v1.5": "D:\ZLCODE\model\\"+"vicuna-7b-v1.5",
                         "guanaco-7b": "D:\ZLCODE\model\guanaco-7B-HF",
-                        "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.2", 
+                        "mistral-7b": "D:\ZLCODE\model\Mistral-7B-Instruct-v0.2",
                         }
     model_path = model_path_dicts[args.pretrained_model]
     if args.seed != -1:
