@@ -318,7 +318,7 @@ def run(args):
     total_success_responses_D = 0  # deepseek方法成功的回答数
 
     if args.proxy_model :
-        results = pd.read_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv")
+        results = pd.read_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv")
     else:
         results = pd.read_csv(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv")
 
@@ -422,7 +422,7 @@ def run(args):
     if args.proxy_model:
         output_dir = f"outputs/{args.pretrained_model}/{args.proxy_model}"
     os.makedirs(output_dir, exist_ok=True)
-    metrics_file = f"{output_dir}/{args.start}_{args.end}_metrics.txt"
+    metrics_file = f"{output_dir}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}_metrics.txt"
     
     with open(metrics_file, 'w', encoding='utf-8') as f:
         # 主要指标
@@ -466,7 +466,7 @@ def run(args):
     if args.proxy_model:
         output_dir = f"outputs/{args.pretrained_model}/{args.proxy_model}"
     os.makedirs(output_dir, exist_ok=True)
-    output_file = f"{output_dir}/{args.start}_{args.end}_with_responses.csv"
+    output_file = f"{output_dir}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}_with_responses.csv"
     results.to_csv(output_file, index=False)
     print(f"\nResults saved to: {output_file}")
     
@@ -479,6 +479,16 @@ if __name__ == "__main__":
     parser.add_argument("--proxy_model", type=str)
     parser.add_argument("--start", type=int, default=1, help="loading data from ith examples.")
     parser.add_argument("--end", type=int, default=10, help="loading data util ith examples.")
+
+    parser.add_argument("--num-iters", type=float, default=2000)
+    parser.add_argument("--cw_weight", type=float, default=100.0)
+    parser.add_argument("--kl_max_weight", type=float, default=100.0)
+    parser.add_argument("--goal-weight", type=float, default=100.0)
+    parser.add_argument("--rej-weight", type=float, default=500.0)
     parser.add_argument("--defense-method", type=str, default="none")
+    parser.add_argument("--mode", type=str, default='proxy',
+                        choices=['suffix', 'control', 'paraphrase', 'proxy'])
+    parser.add_argument("--batch-size", type=int, default=8)
+
     args = parser.parse_args()
     run(args)
