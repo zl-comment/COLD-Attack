@@ -119,15 +119,14 @@ def run(args):
     # Load the model and tokenizer
 
     if os.name == 'nt':  # Windows系统
-        model_name = os.path.join("D:", "ZLCODE", "model", "vicuna-7b-v1.5")
+        model_name = os.path.join("D:", "\ZLCODE", "model", "vicuna-7b-v1.5")
     else:  # Linux 或其他系统
         model_name = os.path.join("/home/zl/ZLCODE/model", "vicuna-7b-v1.5")
 
     print(model_name)
-    gpt_model, gpt_tokenizer = load_model_and_tokenizer(model_name,
-                                                low_cpu_mem_usage=True,
-                                                use_cache=False,
-                                                device="cuda")
+
+    gpt_model, gpt_tokenizer = load_model_and_tokenizer(model_name, low_cpu_mem_usage=True, use_cache=False,
+                                                        device="cuda")
 
     
     data = pd.read_csv("./data/advbench/harmful_behaviors_custom.csv")

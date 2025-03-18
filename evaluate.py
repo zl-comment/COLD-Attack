@@ -392,7 +392,7 @@ def run(args):
     print("\nCalculating PPL scores...")
     ppls_prompt_adv = []
     if os.name == 'nt':  # Windows系统
-        model_name = os.path.join("D:", "ZLCODE", "model", "vicuna-7b-v1.5")
+        model_name = os.path.join("D:", "\ZLCODE", "model", "vicuna-7b-v1.5")
     else:  # Linux 或其他系统
         model_name = os.path.join("/home/zl/ZLCODE/model", "vicuna-7b-v1.5")
 
