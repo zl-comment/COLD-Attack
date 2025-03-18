@@ -14,7 +14,7 @@ stop_words = set(stopwords.words('english'))
 from decoding_suffix_proxy import decode
 
 
-def attack_generation(model_path, device, args, model_back=None, ppl_last=None):
+def attack_generation(target_model_path, device, args, model_back=None, ppl_last=None):
     data = pd.read_csv("./data/advbench/harmful_behaviors_custom.csv")
     # data = pd.read_csv("./data/advbench/harmful_behaviors.csv")
 
@@ -66,7 +66,7 @@ def attack_generation(model_path, device, args, model_back=None, ppl_last=None):
 
         for _ in range(args.repeat_batch):
 
-            _, text, text_post, decoded_text, p_with_adv = decode(model_path, device, x, z, None, args,
+            _, text, text_post, decoded_text, p_with_adv = decode(target_model_path, device, x, z, None, args,
                                                                   DEFAULT_SYSTEM_PROMPT, prefix_prompt,
                                                                   model_back=model_back, zz=z_keywords)
 
