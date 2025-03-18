@@ -87,7 +87,7 @@ def attack_generation(model_path, device, args, model_back=None, ppl_last=None):
         print(results)
 
         # 检查文件是否存在
-        if osp.exists(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv"):
+        if osp.exists(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv"):
             # 如果文件存在，直接覆盖写（会覆盖原有内容，写入新内容）
             results.to_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv", mode='w', header=True)
         else:

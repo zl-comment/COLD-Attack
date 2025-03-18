@@ -125,12 +125,23 @@ def main():
 
 
     device = "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
-    model_path_dicts = {"Llama-2-7b-chat-hf": "D:\ZLCODE\model\Llama-2-7b-chat-hf",
-                        "Vicuna-7b-v1.5": "D:\ZLCODE\model\\"+"vicuna-7b-v1.5",
-                        "guanaco-7b": "D:\ZLCODE\model\guanaco-7B-HF",
-                        "mistral-7b": "D:\ZLCODE\model\Mistral-7B-Instruct-v0.2",
-                        }
+    # 根据操作系统设置基础路径
+    if os.name == 'nt':  # Windows 系统
+        base_dir = r"D:\ZLCODE\model"
+    else:  # Linux 或其他系统
+        base_dir = "/home/zl/ZLCODE/model"  # 请将此处修改为 Linux 下的模型存放路径
+
+    # 利用 os.path.join 拼接完整路径
+    model_path_dicts = {
+        "Llama-2-7b-chat-hf": os.path.join(base_dir, "Llama-2-7b-chat-hf"),
+        "Vicuna-7b-v1.5": os.path.join(base_dir, "vicuna-7b-v1.5"),
+        "guanaco-7b": os.path.join(base_dir, "guanaco-7B-HF"),
+        "mistral-7b": os.path.join(base_dir, "Mistral-7B-Instruct-v0.2"),
+    }
+
+
     model_path = model_path_dicts[args.pretrained_model]
+    print("model_path:", model_path, type(model_path))
     if args.seed != -1:
         seed_everything(args.seed)
     # Load pretrained model

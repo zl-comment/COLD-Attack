@@ -21,7 +21,7 @@ from nltk.tokenize import word_tokenize
 # from evaluation.bert_score import score
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from award.train import get_latent_representation, latent_dim, safety_budget_value
+# from award.train_critic import get_latent_representation, latent_dim, safety_budget_value
 from model.use_distilled_model import load_model
 from opt_util import load_model_and_tokenizer
 from util import *
@@ -35,50 +35,50 @@ from model.model_loader import load_proxy_model
 
 stop_words = set(stopwords.words('english'))
 
-proxy_models_little = ["Vicuna-7b-v1.5", "Llama-3.2-3B", "final_model-10", "final_model","output_hf-v1"]
+proxy_models_little = ["output_hf-v1"]
 
 
-
-
-# 加载训练好的 Critic 模型
-input_dim = 128 + 1  # 隐空间维度128，加上安全预算1维
-hidden_dim = 64
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-class Critic(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int) -> object:
-        """
-        Critic 网络用于预测当前状态的安全性和未来任务成本。
-        输入为扩充状态（隐空间表示 + 安全预算），输入维度为 latent_dim+1。
-
-        目标：输出安全概率和未来任务成本预测，
-               在这里期望生成的正确答案具有低成本，
-               因此如果生成结果与 target 越接近，预测的未来成本应越低。
-        """
-        super(Critic, self).__init__()
-        self.shared = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU()
-        )
-        # 对于安全性，由于目标答案是安全的，可以将安全目标设为 0（低值表示安全）
-        self.safety_head = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-        self.cost_head = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x):
-        shared_out = self.shared(x)
-        safety_prob = self.safety_head(shared_out)
-        future_cost = self.cost_head(shared_out)
-        return safety_prob, future_cost
-
-
-# 加载模型参数
-critic_model: Critic = Critic(input_dim, hidden_dim)  # 构造 Critic 类的实例
-critic_model.load_state_dict(torch.load("D:\\ZLCODE\\COLD-Attack\\award\\critic_model.pt", map_location='cpu'))
-critic_model.to('cpu')
-critic_model.eval()
+#
+#
+# # 加载训练好的 Critic 模型
+# input_dim = 128 + 1  # 隐空间维度128，加上安全预算1维
+# hidden_dim = 64
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#
+# class Critic(nn.Module):
+#     def __init__(self, input_dim: int, hidden_dim: int) -> object:
+#         """
+#         Critic 网络用于预测当前状态的安全性和未来任务成本。
+#         输入为扩充状态（隐空间表示 + 安全预算），输入维度为 latent_dim+1。
+#
+#         目标：输出安全概率和未来任务成本预测，
+#                在这里期望生成的正确答案具有低成本，
+#                因此如果生成结果与 target 越接近，预测的未来成本应越低。
+#         """
+#         super(Critic, self).__init__()
+#         self.shared = nn.Sequential(
+#             nn.Linear(input_dim, hidden_dim),
+#             nn.ReLU()
+#         )
+#         # 对于安全性，由于目标答案是安全的，可以将安全目标设为 0（低值表示安全）
+#         self.safety_head = nn.Sequential(
+#             nn.Linear(hidden_dim, 1),
+#             nn.Sigmoid()
+#         )
+#         self.cost_head = nn.Linear(hidden_dim, 1)
+#
+#     def forward(self, x):
+#         shared_out = self.shared(x)
+#         safety_prob = self.safety_head(shared_out)
+#         future_cost = self.cost_head(shared_out)
+#         return safety_prob, future_cost
+#
+#
+# # 加载模型参数
+# critic_model: Critic = Critic(input_dim, hidden_dim)  # 构造 Critic 类的实例
+# critic_model.load_state_dict(torch.load("D:\\ZLCODE\\COLD-Attack\\award\\critic_model.pt", map_location='cpu'))
+# critic_model.to('cpu')
+# critic_model.eval()
 
 # # 定义评估函数：输入当前状态文本和安全预算，输出 Critic 网络预测结果
 # def evaluate_state(current_text: str, safety_budget_value: float, latent_dim: int = 128):
@@ -154,7 +154,9 @@ def filter_logits_for_target_model(logits, target_vocab_size, target_vocab):
 
 def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None, model_back=None, zz=None):
 
-    
+    torch.cuda.empty_cache()
+
+
     #加载代理模型
 
     proxy_model,proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device)
