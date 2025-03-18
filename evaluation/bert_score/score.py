@@ -31,8 +31,10 @@ def score(cands, refs, bert="bert-base-multilingual-cased",
     print(bert)
     #加载本地模型
 
-    current_dir = os.path.dirname(os.path.realpath(__file__))
-    BERT_BASE_UNCASED = os.path.abspath(os.path.join(current_dir, '..', 'model', 'bert-base-uncased'))
+    if os.name == 'nt':  # Windows系统
+        BERT_BASE_UNCASED = os.path.abspath(os.path.join("D:", "\ZLCODE", 'model', 'bert-base-uncased'))
+    else:  # Linux 或其他系统
+        BERT_BASE_UNCASED = os.path.join("/home/zl/ZLCODE/model", "bert-base-uncased")
 
     print(BERT_BASE_UNCASED)
     tokenizer = BertTokenizer.from_pretrained(BERT_BASE_UNCASED)
@@ -88,8 +90,13 @@ def plot_example(h, r, verbose=False, bert="bert-base-multilingual-cased",
         - :param: `num_layers` (int): the layer of representation to use
     """
     assert bert in bert_types
-    current_dir = os.path.dirname(os.path.realpath(__file__))
-    BERT_BASE_UNCASED = os.path.abspath(os.path.join(current_dir, '..', 'model', 'bert-base-uncased'))
+
+    if os.name == 'nt':  # Windows系统
+        BERT_BASE_UNCASED = os.path.abspath(os.path.join("D:", "\ZLCODE",  'model', 'bert-base-uncased'))
+    else:  # Linux 或其他系统
+        BERT_BASE_UNCASED = os.path.join("/home/zl/ZLCODE/model", "bert-base-uncased")
+
+
 
     print(BERT_BASE_UNCASED)
     if verbose:
