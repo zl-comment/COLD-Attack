@@ -21,7 +21,7 @@ from nltk.tokenize import word_tokenize
 # from evaluation.bert_score import score
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# from award.train_critic import get_latent_representation, latent_dim, safety_budget_value
+from award.train_critic import get_latent_representation, latent_dim, safety_budget_value
 from model.use_distilled_model import load_model
 from opt_util import load_model_and_tokenizer
 from util import *
@@ -39,46 +39,58 @@ proxy_models_little = ["output_hf-v1"]
 
 
 #
-#
-# # 加载训练好的 Critic 模型
-# input_dim = 128 + 1  # 隐空间维度128，加上安全预算1维
-# hidden_dim = 64
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#
-# class Critic(nn.Module):
-#     def __init__(self, input_dim: int, hidden_dim: int) -> object:
-#         """
-#         Critic 网络用于预测当前状态的安全性和未来任务成本。
-#         输入为扩充状态（隐空间表示 + 安全预算），输入维度为 latent_dim+1。
-#
-#         目标：输出安全概率和未来任务成本预测，
-#                在这里期望生成的正确答案具有低成本，
-#                因此如果生成结果与 target 越接近，预测的未来成本应越低。
-#         """
-#         super(Critic, self).__init__()
-#         self.shared = nn.Sequential(
-#             nn.Linear(input_dim, hidden_dim),
-#             nn.ReLU()
-#         )
-#         # 对于安全性，由于目标答案是安全的，可以将安全目标设为 0（低值表示安全）
-#         self.safety_head = nn.Sequential(
-#             nn.Linear(hidden_dim, 1),
-#             nn.Sigmoid()
-#         )
-#         self.cost_head = nn.Linear(hidden_dim, 1)
-#
-#     def forward(self, x):
-#         shared_out = self.shared(x)
-#         safety_prob = self.safety_head(shared_out)
-#         future_cost = self.cost_head(shared_out)
-#         return safety_prob, future_cost
-#
-#
-# # 加载模型参数
-# critic_model: Critic = Critic(input_dim, hidden_dim)  # 构造 Critic 类的实例
-# critic_model.load_state_dict(torch.load("D:\\ZLCODE\\COLD-Attack\\award\\critic_model.pt", map_location='cpu'))
-# critic_model.to('cpu')
-# critic_model.eval()
+def move_to_device(data, device):
+    if isinstance(data, torch.Tensor):
+        return data.to(device)
+    elif isinstance(data, (list, tuple)):
+        return type(data)(move_to_device(item, device) for item in data)
+    else:
+        return data
+
+# 加载训练好的 Critic 模型
+input_dim = 128 + 1  # 隐空间维度128，加上安全预算1维
+hidden_dim = 64
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+class Critic(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int) -> object:
+        """
+        Critic 网络用于预测当前状态的安全性和未来任务成本。
+        输入为扩充状态（隐空间表示 + 安全预算），输入维度为 latent_dim+1。
+
+        目标：输出安全概率和未来任务成本预测，
+               在这里期望生成的正确答案具有低成本，
+               因此如果生成结果与 target 越接近，预测的未来成本应越低。
+        """
+        super(Critic, self).__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU()
+        )
+        # 对于安全性，由于目标答案是安全的，可以将安全目标设为 0（低值表示安全）
+        self.safety_head = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        self.cost_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        shared_out = self.shared(x)
+        safety_prob = self.safety_head(shared_out)
+        future_cost = self.cost_head(shared_out)
+        return safety_prob, future_cost
+
+
+# 加载模型参数
+critic_model: Critic = Critic(input_dim, hidden_dim)  # 构造 Critic 类的实例
+if os.name == 'nt':  # Windows 系统
+    base_dir = r"D:\ZLCODE\COLD-Attack\award"
+else:  # Linux 或其他系统
+    base_dir = "/home/zl/ZLCODE/COLD-Attack/award"  # 请将此处修改为 Linux 下的模型存放路径
+critic_model_path = os.path.join(base_dir, "critic_model.pt")
+critic_model.load_state_dict(torch.load(critic_model_path, map_location=device))
+critic_model.to(device)
+critic_model.eval()
 
 # # 定义评估函数：输入当前状态文本和安全预算，输出 Critic 网络预测结果
 # def evaluate_state(current_text: str, safety_budget_value: float, latent_dim: int = 128):
@@ -152,7 +164,7 @@ def filter_logits_for_target_model(logits, target_vocab_size, target_vocab):
     
     return mapped_logits.long()
 
-def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None, model_back=None, zz=None):
+def decode(target_model_path, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None, model_back=None, zz=None):
 
     torch.cuda.empty_cache()
 
@@ -165,7 +177,7 @@ def decode(model_path, device, x="", z="", constraints=None, args=None, sys_prom
     # proxy_system_prompt="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed and polite answers to the user's questions."
     
 
-    text, _, last_text_ids=decode_proxy_little(proxy_model, proxy_tokenizer, device, x, z, constraints, args, sys_prompt, prefix, model_back, zz)
+    text, _, last_text_ids=decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, x, z, constraints, args, sys_prompt, prefix, model_back, zz)
 
     
     # Clean up proxy model GPU memory
@@ -372,7 +384,7 @@ def query_ollama(text):
 #
 
 
-def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
+def decode_proxy_little(target_model_path,model, tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
                           model_back=None, zz=None):
     """
     x: left context (prompt in lexical task)
@@ -382,6 +394,13 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
     print("启动")
     model.eval()  # 设置评估模式
     logger = setup_logger(args)
+
+    # 加载目标模型和分词器（目标模型在 cuda:1 上）
+    target_tokenizer = AutoTokenizer.from_pretrained(target_model_path, local_files_only=True)
+    target_model = AutoModelForCausalLM.from_pretrained(
+        target_model_path, local_files_only=True, output_hidden_states=True
+    ).to('cuda:1')
+
 
     # 不良词汇
     words = ['sorry', 'apologetic', 'regretful',
@@ -668,32 +687,53 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         if torch.isnan(kl_loss):
             print("Warning: KL loss is NaN, resetting to zero")
             kl_loss = torch.zeros_like(kl_loss)
-        # #Critic网络
-        # if ite <400 :
-        #     # 计算 Critic 网络的未来成本预测，并将其作为 loss 的一部分
-        #     with torch.no_grad():
-        #         # decode_with_model_topk 可以把 soft logits (y_logits_) 转为 token ids
-        #         # 并返回生成的文本
-        #         gen_texts, _, last_ids = decode_with_model_topk(
-        #             model, y_logits_,
-        #             args.topk,  # 其他参数
-        #             soft_forward_x, x_model_past,
-        #             tokenizer, extra_mask=None, bad_mask=None
-        #         )
-        #         # 对整个批次进行评估（假设 gen_texts 是已生成的文本列表）
-        #         batch_latents = [get_latent_representation(text, latent_dim).to('cpu') for text in gen_texts]
-        #         batch_latents = torch.stack(batch_latents)  # 形状: [batch_size, latent_dim]
-        #         safety_tensor = torch.tensor([safety_budget_value] * len(gen_texts, ), dtype=torch.float32,
-        #                                      device='cpu').unsqueeze(1)
-        #         critic_input = torch.cat([batch_latents, safety_tensor], dim=1)
-        #         _, future_cost_pred = critic_model(critic_input)
-        #     # 将 Critic 信号加入总 loss，乘以超参数 lambda_critic
-        #     # lambda_critic = getattr(args, "lambda_critic", 1.0)
-        #     critic_loss = 1 * future_cost_pred.to(device)
-        #     print(critic_loss)
-        # else:
-        #     future_cost_pred = torch.tensor(0.0, device=device)  # 定义一个默认值
-        #     critic_loss = 0.0
+        #Critic网络
+        if ite <1000:
+            # 计算 Critic 网络的未来成本预测，并将其作为 loss 的一部分
+            with torch.no_grad():
+
+
+                # 将传入目标模型的张量移动到 cuda:1
+                y_logits_target = y_logits_.to('cuda:1')
+                soft_forward_x_target = soft_forward_x.to('cuda:1')
+                if x_model_past is not None:
+                    # 假设 x_model_past 是 tuple 或者 tensor，需要逐个移动到 cuda:1
+                    if isinstance(x_model_past, (tuple, list)):
+                        x_model_past_target = move_to_device(x_model_past, 'cuda:1')
+                    else:
+                        x_model_past_target = x_model_past.to('cuda:1')
+                else:
+                    x_model_past_target = None
+
+                # decode_with_model_topk 运行在目标模型上（cuda:1）
+                gen_texts, _, last_ids = decode_with_model_topk(
+                    target_model, y_logits_target,
+                    args.topk,  # 其他参数
+                    soft_forward_x_target, x_model_past_target,
+                    target_tokenizer, extra_mask=None, bad_mask=None
+                )
+
+                # 对整个批次进行评估（假设 gen_texts 是已生成的文本列表）
+                # 这里 get_latent_representation 内部调用目标模型（在 cuda:1），
+                # 计算得到的 latent 再 .to(device) 转移到代理模型所在的设备（cuda:0）
+                batch_latents = [
+                    get_latent_representation(target_model, target_tokenizer, text, latent_dim).to(device)
+                    for text in gen_texts
+                ]
+                batch_latents = torch.stack(batch_latents)  # 形状: [batch_size, latent_dim]
+
+                safety_tensor = torch.tensor(
+                    [safety_budget_value] * len(gen_texts),
+                    dtype=torch.float32, device=device
+                ).unsqueeze(1)
+                critic_input = torch.cat([batch_latents, safety_tensor], dim=1)
+                _, future_cost_pred = critic_model(critic_input)
+            # 将 Critic 信号加入总 loss，确保最终 critic_loss 在 device (cuda:0)
+            critic_loss = 1 * future_cost_pred.to(device)
+            # print(critic_loss)
+        else:
+            future_cost_pred = torch.tensor(0.0, device=device)  # 定义一个默认值
+            critic_loss = 0.0
 
         progress = ite / args.num_iters
         flu_weight = 100*(  1.0 + 0.4 * progress)
@@ -704,7 +744,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         cw_weight = args.cw_weight * (1.0 + 0.3 * progress)
         # flu_clip = 2.0 + progress
         # kl_clip = 0.5 * (1.0 - progress)
-        loss = (goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 - kl_loss_weight * kl_loss) + cw_weight *  cw_loss #+ 100 * critic_loss
+        loss = (goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 - kl_loss_weight * kl_loss) + cw_weight *  cw_loss + 1000 * critic_loss
         # loss = F.softplus(loss)
         loss = loss.mean()
         # l2_reg = torch.norm(epsilon) * 0.01
