@@ -118,7 +118,12 @@ def merge_csv(args):
 def run(args):
     # Load the model and tokenizer
 
-    model_name = "D:/ZLCODE/model/vicuna-7b-v1.5"
+    if os.name == 'nt':  # Windows系统
+        model_name = os.path.join("D:", "ZLCODE", "model", "vicuna-7b-v1.5")
+    else:  # Linux 或其他系统
+        model_name = os.path.join("/home/zl/ZLCODE/model", "vicuna-7b-v1.5")
+
+    print(model_name)
     gpt_model, gpt_tokenizer = load_model_and_tokenizer(model_name,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
