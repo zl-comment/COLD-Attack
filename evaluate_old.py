@@ -214,7 +214,7 @@ if __name__ == "__main__":
     parser.add_argument("--rej-weight", type=float, default=500.0)
     parser.add_argument("--defense-method", type=str, default="none")
     parser.add_argument("--mode", type=str, default='proxy',
-                        choices=['suffix', 'control', 'paraphrase', 'proxy'])
+                        choices=['suffix', 'control', 'paraphrase', 'proxy', 'proxy_one'])
     parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
     run(args)

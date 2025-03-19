@@ -443,7 +443,10 @@ def run(args):
     os.makedirs(output_dir, exist_ok=True)
 
     # 构造文件名
-    filename = f"{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}_metrics.txt"
+    if args.proxy_model:
+        filename = f"{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}_metrics.txt"
+    else:
+        filename = f"{args.start}_{args.end}.csv"
     metrics_file = os.path.join(output_dir, filename)
 
     print(f"Metrics file will be saved to: {metrics_file}")
@@ -494,7 +497,10 @@ def run(args):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    filename = f"{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}_with_responses.csv"
+    if args.proxy_model:
+        filename = f"{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}_metrics.txt"
+    else:
+        filename = f"{args.start}_{args.end}.csv"
     output_file = os.path.join(output_dir, filename)
     results.to_csv(output_file, index=False)
     print(f"\nResults saved to: {output_file}")
@@ -516,7 +522,7 @@ if __name__ == "__main__":
     parser.add_argument("--rej-weight", type=float, default=500.0)
     parser.add_argument("--defense-method", type=str, default="none")
     parser.add_argument("--mode", type=str, default='proxy',
-                        choices=['suffix', 'control', 'paraphrase', 'proxy'])
+                        choices=['suffix', 'control', 'paraphrase', 'proxy','proxy_one'])
     parser.add_argument("--batch-size", type=int, default=8)
 
     args = parser.parse_args()
