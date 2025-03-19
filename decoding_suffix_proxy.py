@@ -189,7 +189,7 @@ def decode(target_model_path, device, x="", z="", constraints=None, args=None, s
     # 如果你希望等待 CUDA 操作完成，可以加入这行：
     torch.cuda.synchronize()  # 等待所有 CUDA 操作完成
 
-    model, tokenizer = load_model_and_tokenizer(model_path,
+    model, tokenizer = load_model_and_tokenizer(target_model_path,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
                                                 device=device)
