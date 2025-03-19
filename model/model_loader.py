@@ -1,7 +1,5 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer,GenerationConfig
-from model.huggingface import FineTuneConfig
-from  model.SuffixManager import SuffixManager
 from transformers import GPTJForCausalLM
 from pathlib import Path
 
@@ -58,8 +56,6 @@ def load_base_model(
 ##加载代理模型
 def load_proxy_model(
     model_path: str,
-    use_system_instructions: bool = False,
-    ft_config: FineTuneConfig | None = None,
     device: str = 'cuda',
     **kwargs
 ) -> tuple:
@@ -68,8 +64,6 @@ def load_proxy_model(
     
     Args:
         model_path (str): 模型路径或名称
-        use_system_instructions (bool): 是否使用系统指令
-        ft_config (FineTuneConfig): 微调配置
         device (str): 运行设备
         **kwargs: 其他参数
     
@@ -88,12 +82,7 @@ def load_proxy_model(
             trust_remote_code=True,
             padding_side='left'
         )
-        # if 'vicuna-7b-v1.5' in model_path:
-        #     tokenizer = AutoTokenizer.from_pretrained(
-        #         "D:\ZLCODE\BabyLlama\models\\"+"vicuna-7b-distilled\\"+"final_model",
-        #         trust_remote_code=True,
-        #         padding_side='left'
-        #     )
+
         
         # 设置填充标记
         if tokenizer.pad_token is None:
@@ -135,27 +124,22 @@ def load_proxy_model(
             use_cache = False
             )
         
-        # 如果不需要微调,冻结模型参数
-        if ft_config is None:
-            for param in model.parameters():
-                param.requires_grad = False
-        
-        # 将模型移动到指定设备
-        if device == 'gpu':
-            model = model.to(device)
 
-        if param.requires_grad:    
-            # 设置为评估模式
-            model.train()
-        else:
-            # 设置为评估模式
-            model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+
+            # 将模型移动到指定设备
+            if device == 'gpu':
+                model = model.to(device)
+
+            if param.requires_grad:
+                # 设置为评估模式
+                model.train()
+            else:
+                # 设置为评估模式
+                model.eval()
         
-        # 创建后缀管理器
-        suffix_manager = SuffixManager(
-            tokenizer=tokenizer,
-            use_system_instructions=use_system_instructions
-        )
+
         if 'MindLLM-1b3' in model_path:
             tokenizer.bos_token_id = 50256
             tokenizer.eos_token_id = 50256
