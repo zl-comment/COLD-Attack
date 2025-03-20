@@ -21,8 +21,6 @@ import copy
 from matplotlib import pyplot as plt
 
 from tqdm import tqdm
-#新添加的import
-from model.huggingface import FineTuneConfig
 
 stop_words = set(stopwords.words('english'))
 
@@ -68,7 +66,6 @@ def setup_logger(args):
 def load_proxy_model(
     model_path: str,
     use_system_instructions: bool = False,
-    ft_config: FineTuneConfig | None = None,
     device: str = 'cuda',
     **kwargs
 ) -> tuple:
@@ -78,12 +75,10 @@ def load_proxy_model(
     Args:
         model_path (str): 模型路径或名称
         use_system_instructions (bool): 是否使用系统指令
-        ft_config (FineTuneConfig): 微调配置
         device (str): 运行设备
         **kwargs: 其他参数
     
-    Returns:
-        tuple: (model, tokenizer, suffix_manager)
+
     """
     try:
         # 检查GPU可用性
@@ -109,11 +104,7 @@ def load_proxy_model(
             torch_dtype=torch.float16 if device=='cuda' else torch.float32,
             device_map='auto' if device=='cuda' else None
         )
-        
-        # 如果不需要微调,冻结模型参数
-        if ft_config is None:
-            for param in model.parameters():
-                param.requires_grad = False
+
         
         # 将模型移动到指定设备
         if device == 'cpu':
@@ -122,13 +113,9 @@ def load_proxy_model(
         # 设置为评估模式
         model.eval()
         
-        # 创建后缀管理器
-        suffix_manager = SuffixManager(
-            tokenizer=tokenizer,
-            use_system_instructions=use_system_instructions
-        )
+
         
-        return model, tokenizer, suffix_manager
+        return model, tokenizer
         
     except Exception as e:
         print(f"加载模型时出错: {str(e)}")
