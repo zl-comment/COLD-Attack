@@ -701,8 +701,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         cw_weight = args.cw_weight * (1.0 + 0.3 * progress)
         # flu_clip = 2.0 + progress
         # kl_clip = 0.5 * (1.0 - progress)
-        loss = (
-                           goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 - kl_loss_weight * kl_loss) + cw_weight * cw_loss  # + 100 * critic_loss
+        loss = ( goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 - kl_loss_weight * kl_loss) + cw_weight * cw_loss  # + 100 * critic_loss
         # loss = F.softplus(loss)
         loss = loss.mean()
         # l2_reg = torch.norm(epsilon) * 0.01
@@ -710,7 +709,7 @@ def decode_proxy_little(model, tokenizer, device, x="", z="", constraints=None, 
         accumulation_steps = 6
         loss = loss / accumulation_steps
         # print("loss", loss)
-        loss.backward(retain_graph=True)
+        loss.backward()
         grad_main = epsilon.grad.clone()
 
         if (ite + 1) % accumulation_steps == 0:

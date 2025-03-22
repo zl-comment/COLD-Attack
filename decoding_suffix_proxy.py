@@ -752,7 +752,7 @@ def decode_proxy_little(target_model_path,model, tokenizer, device, x="", z="", 
         accumulation_steps = 6
         loss = loss / accumulation_steps
         # print("loss", loss)
-        loss.backward(retain_graph=True)
+        loss.backward()
         grad_main = epsilon.grad.clone()
 
 
