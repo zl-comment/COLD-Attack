@@ -128,9 +128,8 @@ def load_proxy_model(
         for param in model.parameters():
             param.requires_grad = False
 
-            # 将模型移动到指定设备
-            if device == 'gpu':
-                model = model.to(device)
+
+            model = model.to(device)
 
             if param.requires_grad:
                 # 设置为评估模式
