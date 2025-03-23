@@ -688,7 +688,7 @@ def decode_proxy_little(target_model_path,model, tokenizer, device, x="", z="", 
             print("Warning: KL loss is NaN, resetting to zero")
             kl_loss = torch.zeros_like(kl_loss)
         #Critic网络
-        if ite <1000:
+        if ite >1000:
             # 计算 Critic 网络的未来成本预测，并将其作为 loss 的一部分
             with torch.no_grad():
 

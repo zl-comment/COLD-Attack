@@ -124,7 +124,7 @@ def main():
         print("CUDA is not available, using CPU instead.")
 
 
-    device = "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() and not args.no_cuda else "cpu"
     # 根据操作系统设置基础路径
     if os.name == 'nt':  # Windows 系统
         base_dir = r"D:\ZLCODE\model"
