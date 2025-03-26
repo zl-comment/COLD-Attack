@@ -94,6 +94,8 @@ def options():
     parser.add_argument("--forbidden_threshold", type=float, default=0.8)
     parser.add_argument("--cw_weight", type=float, default=100)
     parser.add_argument("--cw_loss_kappa", type=float, default=0.05)
+    parser.add_argument("--useapi", type=bool, default=False)
+    parser.add_argument("--api", type=str, default="http://172.20.0.251:8000/v1/completions")
 
     args = parser.parse_args()
     return args
@@ -134,13 +136,14 @@ def main():
     # 利用 os.path.join 拼接完整路径
     model_path_dicts = {
         "Llama-2-7b-chat-hf": os.path.join(base_dir, "Llama-2-7b-chat-hf"),
-        "Vicuna-7b-v1.5": os.path.join(base_dir, "vicuna-7b-v1.5"),
+        "vicuna-7b-v1.5": os.path.join(base_dir, "vicuna-7b-v1.5"),
         "guanaco-7b": os.path.join(base_dir, "guanaco-7B-HF"),
         "mistral-7b": os.path.join(base_dir, "Mistral-7B-Instruct-v0.2"),
     }
-
-
-    model_path = model_path_dicts[args.pretrained_model]
+    if args.useapi:
+        model_path =args.api
+    else:
+        model_path = model_path_dicts[args.pretrained_model]
     print("model_path:", model_path, type(model_path))
     if args.seed != -1:
         seed_everything(args.seed)
