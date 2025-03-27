@@ -46,7 +46,8 @@ class LLM(nn.Module):
         mask = query_seq.mask
         sorted_mask, indices = torch.sort(mask.long(), dim=1, stable=True)
 
-        with self.model.disable_adapter() if use_basemodel else nullcontext():
+        # with self.model.disable_adapter() if use_basemodel else nullcontext():
+        with nullcontext():
             if query_seq.is_hard:
                 ids = query_seq.ids
                 sorted_ids = ids.gather(1, indices)
@@ -219,6 +220,7 @@ class LLM(nn.Module):
                 and not return_key_seq
             ):
                 break
+            print('context=:',context)
             seq = msg_to_seq(
                 msg=msg_dct.msg,
                 tokenizer=self.tokenizer,
