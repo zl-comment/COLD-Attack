@@ -21,8 +21,8 @@ from nltk.tokenize import word_tokenize
 # from evaluation.bert_score import score
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from award.train_critic import get_latent_representation, latent_dim, safety_budget_value
-from model.Apimodel import APIDecodeWithGraph, call_api_completion
+
+from model.Apimodel import  call_api_completion
 from model.use_distilled_model import load_model
 from opt_util import load_model_and_tokenizer
 from util import *
@@ -34,6 +34,7 @@ from evaluate import CustomOllamaClient
 from collections import defaultdict
 from model.model_loader import load_proxy_model
 
+from award.utils import ReturnStruct
 stop_words = set(stopwords.words('english'))
 
 proxy_models_little = ["output_hf-v1"]
@@ -48,62 +49,114 @@ def move_to_device(data, device):
     else:
         return data
 
-# 加载训练好的 Critic 模型
-input_dim = 128 + 1  # 隐空间维度128，加上安全预算1维
-hidden_dim = 64
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-class Critic(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int) -> object:
-        """
-        Critic 网络用于预测当前状态的安全性和未来任务成本。
-        输入为扩充状态（隐空间表示 + 安全预算），输入维度为 latent_dim+1。
 
-        目标：输出安全概率和未来任务成本预测，
-               在这里期望生成的正确答案具有低成本，
-               因此如果生成结果与 target 越接近，预测的未来成本应越低。
-        """
-        super(Critic, self).__init__()
-        self.shared = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU()
+
+
+def compute_adv_loss(
+        y_logits_,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        loss_params=None,
+        proxy_device="cuda",
+        target_device="cuda"
+):
+    """
+    支持proxy和target在不同设备的对抗损失计算
+
+    参数:
+        y_logits_: 扰动生成的logits [batch_size, seq_len, proxy_vocab_size] (在proxy_device上)
+        proxy_tokenizer: 代理模型的tokenizer
+        target_model: 目标模型 (将自动移动到target_device)
+        target_tokenizer: 目标tokenizer
+        loss_params: 损失参数配置字典
+        proxy_device: proxy模型所在的设备
+        target_device: target模型所在的设备
+
+    返回:
+        ReturnStruct对象 (所有张量都在proxy_device上)
+    """
+    # 默认损失参数
+    if loss_params is None:
+        loss_params = {
+            'hard_labels': True,
+            'reweight_loss': False,
+            'reduction': 'none'
+        }
+
+    # 确保target模型在目标设备上
+    target_model = target_model.to(target_device)
+
+    # 1. 在proxy设备上生成提示词序列
+    with torch.device(proxy_device):
+        pred_ids = torch.argmax(y_logits_, dim=-1)
+        prompt_texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True) for ids in pred_ids]
+
+    # 2. 在target设备上编码输入
+    with torch.device(target_device):
+        target_inputs = target_tokenizer(
+            prompt_texts,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=target_model.config.max_position_embeddings
         )
-        # 对于安全性，由于目标答案是安全的，可以将安全目标设为 0（低值表示安全）
-        self.safety_head = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
+        # 将输入数据移到target设备
+        target_inputs = {k: v.to(target_device) for k, v in target_inputs.items()}
+
+    # 3. 在target设备上教师强制生成目标输出
+    with torch.device(target_device), torch.no_grad():
+        target_outputs = target_model(
+            input_ids=target_inputs['input_ids'],
+            attention_mask=target_inputs['attention_mask']
         )
-        self.cost_head = nn.Linear(hidden_dim, 1)
+        target_logits = target_outputs.logits
 
-    def forward(self, x):
-        shared_out = self.shared(x)
-        safety_prob = self.safety_head(shared_out)
-        future_cost = self.cost_head(shared_out)
-        return safety_prob, future_cost
+    # 4. 准备序列数据
+    # 预测序列 (去掉最后一个token)
+    pred_logits = target_logits[:, :-1, :]
+    pred_mask = target_inputs['attention_mask'][:, :-1]
 
+    # 目标序列 (去掉第一个token)
+    target_ids = target_inputs['input_ids'][:, 1:]
+    target_mask = target_inputs['attention_mask'][:, 1:]
 
-# 加载模型参数
-critic_model: Critic = Critic(input_dim, hidden_dim)  # 构造 Critic 类的实例
-if os.name == 'nt':  # Windows 系统
-    base_dir = r"D:\ZLCODE\COLD-Attack\award"
-else:  # Linux 或其他系统
-    base_dir = "/home/zl/ZLCODE/COLD-Attack/award"  # 请将此处修改为 Linux 下的模型存放路径
-critic_model_path = os.path.join(base_dir, "critic_model.pt")
-critic_model.load_state_dict(torch.load(critic_model_path, map_location=device))
-for param in critic_model.parameters():
-    param.requires_grad = False
-critic_model.to(device)
-critic_model.eval()
+    # 5. 计算损失 (在target设备上)
+    with torch.device(target_device):
+        if loss_params['hard_labels']:
+            _loss = F.cross_entropy(
+                pred_logits.transpose(1, 2),
+                target_ids,
+                reduction='none'
+            )
+        else:
+            target_probs = F.softmax(target_logits[:, :-1, :], dim=-1)
+            _loss = F.cross_entropy(
+                pred_logits.transpose(1, 2),
+                target_probs.transpose(1, 2),
+                reduction='none'
+            )
 
-# # 定义评估函数：输入当前状态文本和安全预算，输出 Critic 网络预测结果
-# def evaluate_state(current_text: str, safety_budget_value: float, latent_dim: int = 128):
-#     latent_vector = get_latent_representation(current_text, latent_dim)
-#     state_input = torch.cat([latent_vector, torch.tensor([safety_budget_value], dtype=torch.float32)]).unsqueeze(0).to(device)
-#     with torch.no_grad():
-#         safety_pred, future_cost_pred = critic_model.forward(state_input)
-#     return safety_pred.item(), future_cost_pred.item()
-#
-#
+        if loss_params.get('reweight_loss', False):
+            seq_len = _loss.shape[1]
+            factor = torch.arange(seq_len, dtype=_loss.dtype, device=target_device) + 1
+            _loss = _loss / factor[None, :]
+
+        loss_masked = _loss * target_mask
+        loss_batch = torch.sum(loss_masked, dim=1) / (target_mask.sum(dim=1) + 1e-10)
+        loss = loss_batch.mean()
+
+    # 6. 将所有结果移回proxy设备
+    with torch.device(proxy_device):
+        return ReturnStruct(
+            loss=loss.to(proxy_device),
+            loss_masked=loss_masked.to(proxy_device),
+            loss_batch=loss_batch.to(proxy_device),
+            pred=pred_logits.to(proxy_device),
+            label=target_ids.to(proxy_device),
+            mask=target_mask.to(proxy_device)
+        )
 
 
 
@@ -422,15 +475,13 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     z: optimization target (original ending in counterfactual task)
     constraints: (constraint set in lexical constrained task)
     """
+
     print("启动")
     proxy_model.eval()  # 设置评估模式
     logger = setup_logger(args)
     if not args.useapi:
         # 加载目标模型和分词器（目标模型在 cuda:1 上）
-        target_tokenizer = AutoTokenizer.from_pretrained(target_model_path, local_files_only=True)
-        target_model = AutoModelForCausalLM.from_pretrained(
-            target_model_path, local_files_only=True, output_hidden_states=True
-        ).to('cuda:1')
+        target_model, target_tokenizer  =  load_model_and_tokenizer(target_model_path,low_cpu_mem_usage=True,use_cache=False,device='cuda:1')
 
 
     # 不良词汇
@@ -641,6 +692,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     # -------------------------------
     # 训练循环
     # -------------------------------
+
     for ite in pbar:
         optim.zero_grad()
         y_logits_ = y_logits + epsilon
@@ -718,130 +770,31 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         if torch.isnan(kl_loss):
             print("Warning: KL loss is NaN, resetting to zero")
             kl_loss = torch.zeros_like(kl_loss)
-        # #Critic网络
-        # if ite >1000:
-        #     # 计算 Critic 网络的未来成本预测，并将其作为 loss 的一部分
-        #     with torch.no_grad():
-        #
-        #
-        #         # 将传入目标模型的张量移动到 cuda:1
-        #         y_logits_target = y_logits_.to('cuda:1')
-        #         soft_forward_x_target = soft_forward_x.to('cuda:1')
-        #         if x_model_past is not None:
-        #             # 假设 x_model_past 是 tuple 或者 tensor，需要逐个移动到 cuda:1
-        #             if isinstance(x_model_past, (tuple, list)):
-        #                 x_model_past_target = move_to_device(x_model_past, 'cuda:1')
-        #             else:
-        #                 x_model_past_target = x_model_past.to('cuda:1')
-        #         else:
-        #             x_model_past_target = None
-        #
-        #         # decode_with_model_topk 运行在目标模型上（cuda:1）
-        #         gen_texts, _, last_ids = decode_with_model_topk(
-        #             target_model, y_logits_target,
-        #             args.topk,  # 其他参数
-        #             soft_forward_x_target, x_model_past_target,
-        #             target_tokenizer, extra_mask=None, bad_mask=None
-        #         )
-        #
-        #         # 对整个批次进行评估（假设 gen_texts 是已生成的文本列表）
-        #         # 这里 get_latent_representation 内部调用目标模型（在 cuda:1），
-        #         # 计算得到的 latent 再 .to(device) 转移到代理模型所在的设备（cuda:0）
-        #         batch_latents = [
-        #             get_latent_representation(target_model, target_tokenizer, text, latent_dim).to(device)
-        #             for text in gen_texts
-        #         ]
-        #         batch_latents = torch.stack(batch_latents)  # 形状: [batch_size, latent_dim]
-        #
-        #         safety_tensor = torch.tensor(
-        #             [safety_budget_value] * len(gen_texts),
-        #             dtype=torch.float32, device=device
-        #         ).unsqueeze(1)
-        #         critic_input = torch.cat([batch_latents, safety_tensor], dim=1)
-        #         _, future_cost_pred = critic_model(critic_input)
-        #     # 将 Critic 信号加入总 loss，确保最终 critic_loss 在 device (cuda:0)
-        #     critic_loss = 1 * future_cost_pred.to(device)
-        #     # print(critic_loss)
-        # else:
-        #     future_cost_pred = torch.tensor(0.0, device=device)  # 定义一个默认值
-        #     critic_loss = 0.0
-        if ite > 1000:
-            if args.useapi:  # 当目标模型是通过 API 调用时
-                future_cost_pred = APIDecodeWithGraph.apply(
-                    target_model_path,  # api_url
-                    args.pretrained_model,  # model_name
-                    proxy_model,  # dummy_model（可以用 proxy_model 或 None，如果不使用）
-                    y_logits_,  # y_logits
-                    soft_forward_x,  # soft_forward_x
-                    x_model_past,  # x_model_past
-                    proxy_tokenizer,
-                    args.topk,  # topk（整数）
-                    safety_budget_value,  # safety_budget_value（数值）
-                    critic_model,  # critic_model（Critic 网络对象）
-                    device,  # device
-                    latent_dim,  # latent_dim
-                    1,  # num_spsa_samples
-                    1e-3,  # c
-                    50,  # max_tokens
-                    0.7  # temperature
-                )
 
-                critic_loss = future_cost_pred.to(device)
-            else:
-            # 计算 Critic 网络的未来成本预测，并将其作为 loss 的一部分
-                # 将传入目标模型的张量移动到 cuda:1
-                y_logits_target = y_logits_.to('cuda:1')
-                soft_forward_x_target = soft_forward_x.to('cuda:1')
-                if x_model_past is not None:
-                    # 假设 x_model_past 是 tuple 或者 tensor，需要逐个移动到 cuda:1
-                    if isinstance(x_model_past, (tuple, list)):
-                        x_model_past_target = move_to_device(x_model_past, 'cuda:1')
-                    else:
-                        x_model_past_target = x_model_past.to('cuda:1')
-                else:
-                    x_model_past_target = None
-
-                # decode_with_model_topk 运行在目标模型上（cuda:1）
-                gen_texts, _, last_ids = decode_with_model_topk(
-                    target_model, y_logits_target,
-                    args.topk,  # 其他参数
-                    soft_forward_x_target, x_model_past_target,
-                    target_tokenizer, extra_mask=None, bad_mask=None
-                )
-
-                # 对整个批次进行评估（假设 gen_texts 是已生成的文本列表）
-                # 这里 get_latent_representation 内部调用目标模型（在 cuda:1），
-                # 计算得到的 latent 再 .to(device) 转移到代理模型所在的设备（cuda:0）
-                batch_latents = [
-                    get_latent_representation(target_model, target_tokenizer, text, latent_dim).to(device)
-                    for text in gen_texts
-                ]
-                batch_latents = torch.stack(batch_latents)  # 形状: [batch_size, latent_dim]
-
-                safety_tensor = torch.tensor(
-                    [safety_budget_value] * len(gen_texts),
-                    dtype=torch.float32, device=device
-                ).unsqueeze(1)
-                critic_input = torch.cat([batch_latents, safety_tensor], dim=1)
-                _, future_cost_pred = critic_model(critic_input)
-            # 将 Critic 信号加入总 loss，确保最终 critic_loss 在 device (cuda:0)
-            critic_loss = 1 * future_cost_pred.to(device)
-            # print(critic_loss)
-
-        else:
-            future_cost_pred = torch.tensor(0.0, device=device)  # 定义一个默认值
-            critic_loss = future_cost_pred.to(device)
-
+        # if ite < 1000:
+            #使用教师强制学习和交叉熵loss
+    #输入y_logits_ proxy_tokenizer target_model target_tokenizer
+        ReturnStruct=compute_adv_loss(
+            y_logits_,
+            proxy_tokenizer,
+            target_model,
+            target_tokenizer,
+            loss_params=None,
+            proxy_device=proxy_model.device,
+            target_device=target_model.device
+        )
+        # print("ReturnStruct:",ReturnStruct)
         progress = ite / args.num_iters
         flu_weight = 100*(  1.0 + 0.4 * progress)
         # kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))
         kl_loss_weight =  args.kl_max_weight * (1.0 - 0.3 * progress)
         goal_weight = args.goal_weight * (1.0 + 0.3 * progress)
         rej_weight = args.rej_weight * (1.0 + 0.2 * progress)
+        Re_weight = 1000 * (1.0 + 0.2 * progress)
         cw_weight = args.cw_weight * (1.0 + 0.3 * progress)
         # flu_clip = 2.0 + progress
         # kl_clip = 0.5 * (1.0 - progress)
-        loss = (goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 - kl_loss_weight * kl_loss) + cw_weight *  cw_loss + 1000 * critic_loss
+        loss = (goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 - kl_loss_weight * kl_loss) + cw_weight *  cw_loss - Re_weight * ReturnStruct.loss
         # loss = F.softplus(loss)
         loss = loss.mean()
         # l2_reg = torch.norm(epsilon) * 0.01
@@ -869,7 +822,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 'loss/bleu': c_loss_2.mean().item(),
                 'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
                 'loss/kl': kl_loss.mean().item(),
-                'loss/ Critic': critic_loss.mean().item(),
+                'loss/ Critic': ReturnStruct.loss.mean().item(),
                 'progress': progress,
                 'weights/goal': goal_weight,
                 'weights/fluency': flu_weight,
