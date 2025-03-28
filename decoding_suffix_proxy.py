@@ -21,7 +21,7 @@ from nltk.tokenize import word_tokenize
 # from evaluation.bert_score import score
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
+from award.reaward import compute_adv_loss_from_safe_baseline_min_gap, build_safe_prompt
 from model.Apimodel import  call_api_completion
 from model.use_distilled_model import load_model
 from opt_util import load_model_and_tokenizer
@@ -49,114 +49,10 @@ def move_to_device(data, device):
     else:
         return data
 
+from award.utils import ReturnStruct
+import torch.nn.functional as F
 
 
-
-
-def compute_adv_loss(
-        y_logits_,
-        proxy_tokenizer,
-        target_model,
-        target_tokenizer,
-        loss_params=None,
-        proxy_device="cuda",
-        target_device="cuda"
-):
-    """
-    支持proxy和target在不同设备的对抗损失计算
-
-    参数:
-        y_logits_: 扰动生成的logits [batch_size, seq_len, proxy_vocab_size] (在proxy_device上)
-        proxy_tokenizer: 代理模型的tokenizer
-        target_model: 目标模型 (将自动移动到target_device)
-        target_tokenizer: 目标tokenizer
-        loss_params: 损失参数配置字典
-        proxy_device: proxy模型所在的设备
-        target_device: target模型所在的设备
-
-    返回:
-        ReturnStruct对象 (所有张量都在proxy_device上)
-    """
-    # 默认损失参数
-    if loss_params is None:
-        loss_params = {
-            'hard_labels': True,
-            'reweight_loss': False,
-            'reduction': 'none'
-        }
-
-    # 确保target模型在目标设备上
-    target_model = target_model.to(target_device)
-
-    # 1. 在proxy设备上生成提示词序列
-    with torch.device(proxy_device):
-        pred_ids = torch.argmax(y_logits_, dim=-1)
-        prompt_texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True) for ids in pred_ids]
-
-    # 2. 在target设备上编码输入
-    with torch.device(target_device):
-        target_inputs = target_tokenizer(
-            prompt_texts,
-            return_tensors='pt',
-            padding=True,
-            truncation=True,
-            max_length=target_model.config.max_position_embeddings
-        )
-        # 将输入数据移到target设备
-        target_inputs = {k: v.to(target_device) for k, v in target_inputs.items()}
-
-    # 3. 在target设备上教师强制生成目标输出
-    with torch.device(target_device), torch.no_grad():
-        target_outputs = target_model(
-            input_ids=target_inputs['input_ids'],
-            attention_mask=target_inputs['attention_mask']
-        )
-        target_logits = target_outputs.logits
-
-    # 4. 准备序列数据
-    # 预测序列 (去掉最后一个token)
-    pred_logits = target_logits[:, :-1, :]
-    pred_mask = target_inputs['attention_mask'][:, :-1]
-
-    # 目标序列 (去掉第一个token)
-    target_ids = target_inputs['input_ids'][:, 1:]
-    target_mask = target_inputs['attention_mask'][:, 1:]
-
-    # 5. 计算损失 (在target设备上)
-    with torch.device(target_device):
-        if loss_params['hard_labels']:
-            _loss = F.cross_entropy(
-                pred_logits.transpose(1, 2),
-                target_ids,
-                reduction='none'
-            )
-        else:
-            target_probs = F.softmax(target_logits[:, :-1, :], dim=-1)
-            _loss = F.cross_entropy(
-                pred_logits.transpose(1, 2),
-                target_probs.transpose(1, 2),
-                reduction='none'
-            )
-
-        if loss_params.get('reweight_loss', False):
-            seq_len = _loss.shape[1]
-            factor = torch.arange(seq_len, dtype=_loss.dtype, device=target_device) + 1
-            _loss = _loss / factor[None, :]
-
-        loss_masked = _loss * target_mask
-        loss_batch = torch.sum(loss_masked, dim=1) / (target_mask.sum(dim=1) + 1e-10)
-        loss = loss_batch.mean()
-
-    # 6. 将所有结果移回proxy设备
-    with torch.device(proxy_device):
-        return ReturnStruct(
-            loss=loss.to(proxy_device),
-            loss_masked=loss_masked.to(proxy_device),
-            loss_batch=loss_batch.to(proxy_device),
-            pred=pred_logits.to(proxy_device),
-            label=target_ids.to(proxy_device),
-            mask=target_mask.to(proxy_device)
-        )
 
 
 
@@ -773,16 +669,27 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
 
         # if ite < 1000:
             #使用教师强制学习和交叉熵loss
-    #输入y_logits_ proxy_tokenizer target_model target_tokenizer
-        ReturnStruct=compute_adv_loss(
+    # #输入y_logits_ proxy_tokenizer target_model target_tokenizer
+    #     ReturnStruct=compute_adv_loss(
+    #         y_logits_,
+    #         proxy_tokenizer,
+    #         target_model,
+    #         target_tokenizer,
+    #         loss_params=None,
+    #         proxy_device=proxy_model.device,
+    #         target_device=target_model.device
+    #     )
+        ReturnStruct = compute_adv_loss_from_safe_baseline_min_gap(
             y_logits_,
-            proxy_tokenizer,
-            target_model,
-            target_tokenizer,
-            loss_params=None,
+            harm_prompt=sys_prompt + x,
+            proxy_tokenizer=proxy_tokenizer,
+            target_model=target_model,
+            target_tokenizer=target_tokenizer,
+            safe_prompt=build_safe_prompt(sys_prompt + x),
             proxy_device=proxy_model.device,
             target_device=target_model.device
         )
+
         # print("ReturnStruct:",ReturnStruct)
         progress = ite / args.num_iters
         flu_weight = 100*(  1.0 + 0.4 * progress)
@@ -794,7 +701,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         cw_weight = args.cw_weight * (1.0 + 0.3 * progress)
         # flu_clip = 2.0 + progress
         # kl_clip = 0.5 * (1.0 - progress)
-        loss = (goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 - kl_loss_weight * kl_loss) + cw_weight *  cw_loss - Re_weight * ReturnStruct.loss
+        loss = (goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 - kl_loss_weight * kl_loss) + cw_weight *  cw_loss + Re_weight * ReturnStruct.loss
         # loss = F.softplus(loss)
         loss = loss.mean()
         # l2_reg = torch.norm(epsilon) * 0.01
