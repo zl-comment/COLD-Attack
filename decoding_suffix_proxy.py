@@ -21,7 +21,8 @@ from nltk.tokenize import word_tokenize
 # from evaluation.bert_score import score
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from award.reaward import compute_adv_loss_from_safe_baseline_min_gap, build_safe_prompt
+from award.reaward import compute_adv_loss_from_safe_baseline_min_gap, build_safe_prompt, compute_cw_loss, \
+    compute_semantic_reject_loss, compute_rejection_prob_loss, get_reject_token_ids
 from model.Apimodel import  call_api_completion
 from model.use_distilled_model import load_model
 from opt_util import load_model_and_tokenizer
@@ -629,6 +630,8 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         c_loss_1 = torch.nn.CrossEntropyLoss(reduction='none')(z_logits, z_t.view(-1))
         c_loss_1 = c_loss_1.view(args.batch_size, -1).mean(-1)
 
+
+
         # ------------------- 添加 CW loss -------------------
         seq_len = z_t.shape[1]
         # 重塑为 [batch, seq_len, vocab_size]
@@ -638,17 +641,45 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         # 构造 mask，排除目标 token
         mask = torch.ones_like(z_logits_reshaped, dtype=torch.bool)
         mask.scatter_(2, z_t.unsqueeze(-1), False)
-        other_logits = z_logits_reshaped.masked_fill(~mask, float('-inf'))
-        max_other_logits, _ = torch.max(other_logits, dim=2)
-        # 计算 f(x') 部分，并 clamp 下界为 -cw_loss_kappa
-        confidence = 10 # 可调超参数
-        cw_f = torch.clamp(-(max_other_logits - target_logits - confidence), min=-args.cw_loss_kappa) #可变超参数
-        cw_loss_term = cw_f.mean()
-        # 对 epsilon 的 L2 正则项
-        # l2_loss = torch.norm(epsilon)
-        cw_loss = 1 * cw_loss_term   #可变权重
+        #--------------------------方案一--------------------------
+        # other_logits = z_logits_reshaped.masked_fill(~mask, float('-inf'))
+        # max_other_logits, _ = torch.max(other_logits, dim=2)
+        # # 计算 f(x') 部分，并 clamp 下界为 -cw_loss_kappa
+        # confidence = 10 # 可调超参数
+        # cw_f = torch.clamp(-(max_other_logits - target_logits - confidence), min=-args.cw_loss_kappa) #可变超参数
+        # cw_loss_term = cw_f.mean()
+        # cw_loss = 1 * cw_loss_term   #可变权重
+        # --------------------------------------------------------
+        # --------------------------方案二--------------------------
+        cw_loss = compute_cw_loss(z_logits_reshaped, z_t, topk=5, margin=2.0)
+        # --------------------------------------------------------
         # -----------------------------------------------------
 
+        #----------------词向量嵌入语义拒绝--------------------------
+        embedding_layer = proxy_model.get_input_embeddings()
+
+        sem_loss = compute_semantic_reject_loss(y_logits_, bad_words_t.flatten().unique().tolist(), embedding_layer,threshold=0.7 )
+        # ----------------词向量--------------------------
+
+
+
+
+        #-------------------------------------------------
+        # 在训练循环中调用
+        # 在训练前预计算拒绝 token IDs
+        reject_token_ids = get_reject_token_ids(target_tokenizer, words)
+        reject_loss = compute_rejection_prob_loss(
+            y_logits_,
+            proxy_tokenizer,
+            target_model,
+            target_tokenizer,
+            target_model.device,
+            reject_token_ids  # 传入预计算的拒绝 token IDs
+        )
+
+
+
+        #--------------------------------------------------
         c_loss_2 = batch_log_bleulosscnn_ae(decoder_outputs=y_logits_.transpose(0, 1),
                                              target_idx=bad_words_t,
                                              ngram_list=[1])
@@ -687,30 +718,43 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             target_tokenizer=target_tokenizer,
             safe_prompt=build_safe_prompt(sys_prompt + x),
             proxy_device=proxy_model.device,
-            target_device=target_model.device
+            target_device=target_model.device,
         )
 
         # print("ReturnStruct:",ReturnStruct)
+        # progress = ite / args.num_iters
+        # flu_weight = 100*(  1.0 + 0.4 * progress)
+        # kl_loss_weight =  args.kl_max_weight * (1.0 - 0.3 * progress)
+        # goal_weight = args.goal_weight * (1.0 + 0.3 * progress)
+        # rej_weight = args.rej_weight * (1.0 + 0.2 * progress)
+        # Re_weight = 2000 * (1.0 +  progress)
+        # cw_weight = args.cw_weight * (1.0 + 0.3 * progress)
+        # 动态权重设置
         progress = ite / args.num_iters
-        flu_weight = 100*(  1.0 + 0.4 * progress)
-        # kl_loss_weight = max(0.1, args.kl_max_weight * (1.0 - progress))
-        kl_loss_weight =  args.kl_max_weight * (1.0 - 0.3 * progress)
-        goal_weight = args.goal_weight * (1.0 + 0.3 * progress)
-        rej_weight = args.rej_weight * (1.0 + 0.2 * progress)
-        Re_weight = 1000 * (1.0 + 0.2 * progress)
-        cw_weight = args.cw_weight * (1.0 + 0.3 * progress)
-        # flu_clip = 2.0 + progress
-        # kl_clip = 0.5 * (1.0 - progress)
-        loss = (goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 - kl_loss_weight * kl_loss) + cw_weight *  cw_loss + Re_weight * ReturnStruct.loss
+        flu_weight = 50 * (1.0 + 0.2 * progress)  # 适当降低流畅性权重
+        rej_weight = args.rej_weight * (1.0 + 0.5 * progress)  # 增加拒绝相关损失权重
+        Re_weight = 1000 * (1.0 + 0.5 * progress)  # 大幅增加ReturnStruct权重
+        kl_loss_weight = args.kl_max_weight*10 * (1.0 - 0.3 * progress)  # 随着训练进行减小语义拒绝损失权重
+        goal_weight = args.goal_weight * (1.0 + 0.3 * progress)  # 增加目标文本相似度权重
+        cw_weight = args.cw_weight * (1.0 + 0.5 * progress)  # 增加CW损失权重
+        #1.全+     全生成的是拒绝
+        #2.（- Re_weight * ReturnStruct.loss）
+        #这个参数图还可以 但是结果只有一半不到成功
+        # loss =goal_weight * c_loss_1 + flu_weight * flu_loss + 100 * reject_loss.to(device) - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device) + cw_weight *  cw_loss - Re_weight * ReturnStruct.loss
+        #这个比上一个图低一点 结果一半成功
+        # loss =goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device)  - Re_weight * ReturnStruct.loss
+        loss =goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device)  + Re_weight * ReturnStruct.loss
         # loss = F.softplus(loss)
         loss = loss.mean()
         # l2_reg = torch.norm(epsilon) * 0.01
         # loss += l2_reg
-        accumulation_steps = 6
+        accumulation_steps = 5
         loss = loss / accumulation_steps
         # print("loss", loss)
         loss.backward()
-        grad_main = epsilon.grad.clone()
+        # 在 loss.backward() 后添加
+        torch.nn.utils.clip_grad_norm_([epsilon], max_norm=1.0)
+
 
 
         if (ite + 1) % accumulation_steps == 0:
@@ -718,18 +762,33 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             scheduler.step()
         #关注loss
         pbar.set_postfix(loss=loss.item())
+        # 定期打印生成结果
+        if args.verbose and ((ite + 1) % args.print_every == 0 or ite == 0 or ite + 1 == args.num_iters):
+            text, _, last_text_ids = decode_with_model_topk(
+                proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None, bad_mask=None)
+            text_post = text
+            for bi in range(args.batch_size):
+                prompt = x + " " + text_post[bi]
+                input_ids = proxy_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+                logger.info("\n Output of the model:\n")
+                output_ids = proxy_model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
+                                            top_k=args.topk)
+                print("output_ids:",proxy_tokenizer.decode(output_ids[0], skip_special_tokens=True))
+
+
 
         if args.wandb:
             wandb_step = ite + 1
             wandb.log({
                 'loss/total': loss.item(),
-                'loss/fluency': flu_loss.mean().item(),
-                'loss/target': c_loss_1.mean().item(),
-                'loss/cw': cw_loss.mean().item(),
-                'loss/bleu': c_loss_2.mean().item(),
-                'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
-                'loss/kl': kl_loss.mean().item(),
-                'loss/ Critic': ReturnStruct.loss.mean().item(),
+                'loss/fluency': flu_weight * flu_loss.mean().item(),
+                'loss/target': goal_weight *  c_loss_1.mean().item(),
+                # 'loss/cw': cw_loss.mean().item(),
+                'loss/bleu': rej_weight * c_loss_2.mean().item(),
+                # 'loss/reject': reject_loss.mean().item(),
+                # 'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
+                'loss/kl_sm': kl_loss_weight * sem_loss.mean().item(),
+                'loss/ Critic': Re_weight * ReturnStruct.loss.mean().item(),
                 'progress': progress,
                 'weights/goal': goal_weight,
                 'weights/fluency': flu_weight,
@@ -737,7 +796,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 'weights/kl_loss_weight': kl_loss_weight,
                 'norm/epsilon': torch.norm(epsilon).item(),
                 'norm/y_logits': torch.norm(y_logits).item(),
-                'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
+                # 'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
                 'norm/y_logits_t': torch.norm(y_logits_t).item(),
                 'learning_rate': scheduler.get_last_lr()[0]
             }, step=wandb_step)
