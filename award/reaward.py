@@ -4,11 +4,140 @@ import torch
 import torch.nn.functional as F
 import time
 from award.utils import ReturnStruct
-
-
+from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
 # -----------------------------------------
 # 1. 定义辅助函数（分词、编辑距离、SWES、奖励计算、动态温度）
 # -----------------------------------------
+def get_reject_token_ids(target_tokenizer, reject_words):
+    """将拒绝词列表转换为目标模型的 token IDs"""
+    reject_token_ids = set()
+    for word in reject_words:
+        tokens = target_tokenizer.encode(word, add_special_tokens=False)
+        if len(tokens) > 0:
+            # 添加所有 token（处理多 token 词汇）
+            reject_token_ids.update(tokens)
+    return list(reject_token_ids)
+
+#
+# def compute_rejection_prob_loss(
+#         y_logits,
+#         proxy_tokenizer,
+#         target_model,
+#         target_tokenizer,
+#         target_device,
+#         reject_token_ids  # 预计算的拒绝 token IDs 列表
+# ):
+#     """ 计算目标模型对生成文本的拒绝概率 """
+#     # 解码生成文本
+#     texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True)
+#              for ids in torch.argmax(y_logits, dim=-1)]
+#
+#     # 目标模型推理
+#     inputs = target_tokenizer(
+#         texts,
+#         return_tensors="pt",
+#         padding=True,
+#         truncation=True
+#     ).to(target_device)
+#
+#     with torch.no_grad():
+#         outputs = target_model(**inputs)
+#         logits = outputs.logits  # [batch, seq_len, vocab]
+#
+#         # 计算所有拒绝 token 的概率
+#         reject_probs = torch.zeros(logits.shape[0], device=target_device)
+#         for idx in range(logits.shape[1]):  # 遍历每个 token 位置
+#             token_probs = F.softmax(logits[:, idx, :], dim=-1)
+#             reject_probs += token_probs[:, reject_token_ids].sum(dim=-1)  # 累加所有拒绝词概率
+#
+#
+#         # 平均每个 token 的拒绝概率
+#         reject_probs /= logits.shape[1]
+#
+#     return reject_probs.mean()
+#
+def compute_rejection_prob_loss(
+        y_logits,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        target_device,
+        reject_token_ids  # 预计算的拒绝 token IDs 列表
+):
+    """ 计算目标模型对生成文本的拒绝概率（修改为关注局部最高概率）
+    通过对每个样本中所有 token 的拒绝词概率取最大值来反映局部高概率问题
+    """
+    from transformers import logging
+    logging.set_verbosity_error()
+
+    # 解码生成文本
+    texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True)
+             for ids in torch.argmax(y_logits, dim=-1)]
+
+    # 目标模型推理
+    inputs = target_tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).to(target_device)
+
+    with torch.no_grad():
+        outputs = target_model(**inputs)
+        logits = outputs.logits  # [batch, seq_len, vocab]
+
+        # 对每个 token 计算拒绝词的概率
+        token_reject_probs = []
+        for idx in range(logits.shape[1]):  # 遍历每个 token 位置
+            token_probs = F.softmax(logits[:, idx, :], dim=-1)
+            # 累加该位置上所有拒绝词的概率
+            token_reject = token_probs[:, reject_token_ids].sum(dim=-1)  # [batch]
+            token_reject_probs.append(token_reject.unsqueeze(1))
+        # 拼接成 [batch, seq_len]
+        token_reject_probs = torch.cat(token_reject_probs, dim=1)
+        # 取每个样本中拒绝概率最高的那个 token
+        max_reject_probs = token_reject_probs.max(dim=1)[0]  # [batch]
+
+    return max_reject_probs.mean()
+
+
+def compute_cw_loss(z_logits, z_t, topk=5, margin=1.0):
+    target_logits = torch.gather(z_logits, -1, z_t.unsqueeze(-1)).squeeze(-1)
+    mask = torch.ones_like(z_logits, dtype=torch.bool)
+    mask.scatter_(-1, z_t.unsqueeze(-1), False)
+    other_logits = z_logits.masked_fill(~mask, -float('inf'))
+    topk_logits = other_logits.topk(topk, dim=-1).values  # 取 Top-K 非目标 logits
+    cw_loss = F.relu(topk_logits - target_logits.unsqueeze(-1) + margin).mean()  # 多 token 对比
+    return cw_loss
+
+def compute_semantic_reject_loss(y_logits, bad_word_ids, embedding_layer, threshold=0.8):
+    """
+    y_logits: [batch, seq_len, vocab_size]
+    bad_word_ids: List[int] 一维的拒绝词 ID 列表（如 [1, 7423, 27746]）
+    embedding_layer: 代理模型的 token 嵌入层
+    """
+    # 检查输入合法性
+    assert isinstance(bad_word_ids, list), "bad_word_ids 必须是 List[int]"
+    assert all(isinstance(x, int) for x in bad_word_ids), "bad_word_ids 必须全为整数"
+
+    # 获取预测 token 的嵌入
+    pred_ids = torch.argmax(y_logits, dim=-1)  # [batch, seq_len]
+    pred_embeddings = embedding_layer(pred_ids)  # [batch, seq_len, emb_dim]
+
+    # 获取拒绝词的嵌入（处理梯度警告）
+    with torch.no_grad():
+        bad_tensor = torch.tensor(bad_word_ids, device=y_logits.device)
+        bad_embeddings = embedding_layer(bad_tensor)  # [num_bad, emb_dim]
+
+    # 调整维度以支持广播
+    pred_emb = pred_embeddings.unsqueeze(2)  # [batch, seq_len, 1, emb_dim]
+    bad_emb = bad_embeddings.unsqueeze(0).unsqueeze(0)  # [1, 1, num_bad, emb_dim]
+
+    # 计算余弦相似度（自动广播）
+    sim = F.cosine_similarity(pred_emb, bad_emb, dim=-1)  # [batch, seq_len, num_bad]
+
+    # 惩罚高相似度
+    return F.relu(sim.max(dim=-1).values - threshold).mean()
 
 DEFAULT_HARM_SAFE_MAPPING = {
     "hack": "explore",
@@ -71,6 +200,7 @@ def build_safe_prompt(harm_prompt: str, mapping: dict = None, safe_prompt_from_d
 
     return safe_prompt
 
+
 def compute_adv_loss_from_safe_baseline_min_gap(
     y_logits_,
     harm_prompt: str,
@@ -82,27 +212,34 @@ def compute_adv_loss_from_safe_baseline_min_gap(
     mapping_dict: dict = None,
     proxy_device="cuda:0",
     target_device="cuda:1",
-    max_length=128,  # 新增参数
-    use_kl=False      # 是否启用 KL 散度
+    max_length=128,           # 输入最大长度，用于编码 prompt
+    use_kl=False,             # 是否启用 KL 散度
+    classify_token_length=15  # 用于二分类器的生成文本中新生成的 token 数量（比如 10 或 15）
 ):
+    if target_tokenizer.pad_token_id is None:
+        target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
+
+
+
     if loss_params is None:
         loss_params = {"hard_labels": True, "reweight_loss": False, "reduction": "none"}
 
-    # 解码扰动后缀
+    # 1. 解码扰动后缀（保持原有流程）
     with torch.device(proxy_device):
         pred_ids = torch.argmax(y_logits_, dim=-1)
         suffix_texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True) for ids in pred_ids]
 
+    # 2. 拼接 harm_prompt 与扰动后缀，构成 harm+后缀 文本；同时构造安全端文本（利用 build_safe_prompt 构造安全提示）
     harm_prompts = [harm_prompt + suffix for suffix in suffix_texts]
     resolved_safe_prompt = build_safe_prompt(harm_prompt, mapping=mapping_dict, safe_prompt_from_data=safe_prompt)
-    safe_prompts = [resolved_safe_prompt] * len(harm_prompts)
+    safe_prompts = [resolved_safe_prompt for _ in harm_prompts]
 
-    # 对齐输入长度
+    # 3. 对齐输入长度并编码为 target_model 的输入
     harm_inputs = target_tokenizer(
         harm_prompts,
         return_tensors='pt',
-        padding='max_length',  # 填充到统一长度
-        max_length=max_length,  # 显式指定最大长度
+        padding='max_length',
+        max_length=max_length,
         truncation=True
     ).to(target_device)
     safe_inputs = target_tokenizer(
@@ -113,33 +250,228 @@ def compute_adv_loss_from_safe_baseline_min_gap(
         truncation=True
     ).to(target_device)
 
-    # 模型推理
-    harm_out = target_model(**harm_inputs)
-    safe_out = target_model(**safe_inputs)
+    # 4. 使用 target_model 生成文本，注意使用 max_new_tokens 生成新增的 token 部分
+    generated_harm_ids = target_model.generate(
+        **harm_inputs,
+        max_new_tokens=classify_token_length,
+        do_sample=False,  # 强制使用贪心搜索
+        pad_token_id=target_tokenizer.pad_token_id  # 确保pad_token_id正确设置
+    )
+    generated_safe_ids = target_model.generate(
+        **safe_inputs,
+        max_new_tokens=classify_token_length,
+        do_sample=False,
+        pad_token_id=target_tokenizer.pad_token_id
+    )
 
-    # 取 logits（自动对齐长度）
-    harm_logits = harm_out.logits[:, :-1, :]
-    safe_logits = safe_out.logits[:, :-1, :]
+    # 5. 提取新增生成的 token（即剔除 prompt 部分），作为二分类器输入
+    harm_prompt_length = harm_inputs.input_ids.shape[1]
+    safe_prompt_length = safe_inputs.input_ids.shape[1]
+    harm_new_tokens = generated_harm_ids[:, harm_prompt_length:]
+    safe_new_tokens = generated_safe_ids[:, safe_prompt_length:]
 
-    # 计算交叉熵损失
-    harm_loss = F.cross_entropy(harm_logits.transpose(1, 2), harm_inputs['input_ids'][:, 1:], reduction='none')
-    safe_loss = F.cross_entropy(safe_logits.transpose(1, 2), safe_inputs['input_ids'][:, 1:], reduction='none')
+    # 如果生成的 token 数不足 classify_token_length，则进行截断或补齐处理（此处假设生成数量足够）
+    harm_class_ids = harm_new_tokens[:, :classify_token_length]
+    safe_class_ids = safe_new_tokens[:, :classify_token_length]
+    harm_attention_mask = (harm_class_ids != target_tokenizer.pad_token_id).long()
+    safe_attention_mask = (safe_class_ids != target_tokenizer.pad_token_id).long()
 
-    # 计算 KL 散度（可选）
+    # 6. 加载微调后的二分类器（distilbert_suffix.pt）
+    # 采用如下方式加载：先构造预训练模型，再加载 state_dict
+    classifier = DistilBertForSequenceClassification.from_pretrained('/home/zl/ZLCODE/model/distilbert-base-uncased')
+    classifier.load_state_dict(torch.load("/home/zl/ZLCODE/COLD-Attack/award/distilbert_suffix.pt", map_location=target_device))
+    classifier.to(target_device)
+    classifier.eval()
+
+    # 7. 使用二分类器得到 logits，形状为 (batch, 2)
+    #    规则：若 logits 中 v[0] > v[1] 则判定为有害
+    v_harm = classifier(input_ids=harm_class_ids, attention_mask=harm_attention_mask).logits
+    v_safe = classifier(input_ids=safe_class_ids, attention_mask=safe_attention_mask).logits
+
+    # 8. 计算交叉熵损失：
+    #    harm 分支目标标签为 0（有害），safe 分支目标标签为 1（安全）
+    criterion = torch.nn.CrossEntropyLoss(reduction='none')
+    harm_targets = torch.zeros(v_harm.size(0), dtype=torch.long).to(target_device)
+    safe_targets = torch.zeros(v_safe.size(0), dtype=torch.long).to(target_device)
+    harm_loss = criterion(v_harm, harm_targets)  # 每个样本的损失
+    safe_loss = criterion(v_safe, safe_targets)
+
+    # 9. 可选：计算 KL 散度（这里采用 harm 与 safe 分支在 target_model 前向传播得到的输出）
     if use_kl:
+        harm_forward = target_model(**harm_inputs)
+        safe_forward = target_model(**safe_inputs)
+        # 去除最后一个 token（与原来保持一致）
+        harm_logits = harm_forward.logits[:, :-1, :]
+        safe_logits = safe_forward.logits[:, :-1, :]
         harm_probs = F.softmax(harm_logits, dim=-1)
         safe_probs = F.softmax(safe_logits, dim=-1)
         kl_loss = F.kl_div(harm_probs.log(), safe_probs, reduction='batchmean')
     else:
         kl_loss = 0.0
 
-    # 组合损失
-    adv_loss = (harm_loss.mean() - safe_loss.mean()) + kl_loss
+    # 10. 组合损失：目标为让 harm 分支（经对抗生成后）越来越趋向不安全（即 harm_loss 降低），而 safe 分支损失较大
+    adv_loss = (harm_loss - safe_loss).mean() + kl_loss
 
     return ReturnStruct(
         loss=adv_loss.to(proxy_device),
         pred=pred_ids.to(proxy_device)
     )
+
+
+#
+# def compute_adv_loss_from_safe_baseline_min_gap(
+#     y_logits_,
+#     harm_prompt: str,
+#     proxy_tokenizer,
+#     target_model,
+#     target_tokenizer,
+#     safe_prompt: str = None,
+#     loss_params: dict = None,
+#     mapping_dict: dict = None,
+#     proxy_device="cuda:0",
+#     target_device="cuda:1",
+#     max_length=128,  # 新增参数
+#     use_kl=False,     # 是否启用 KL 散度
+#     bad_word_ids=None,  # 新增参数：拒绝词ID列表
+#     threshold=0.8     # 语义拒绝的阈值
+# ):
+#     if loss_params is None:
+#         loss_params = {"hard_labels": True, "reweight_loss": False, "reduction": "none"}
+#
+#     # 解码扰动后缀（同样保持原来的做法）
+#     with torch.device(proxy_device):
+#         pred_ids = torch.argmax(y_logits_, dim=-1)
+#         suffix_texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True) for ids in pred_ids]
+#
+#     # 拼接 harm prompt + 后缀
+#     harm_prompts = [harm_prompt + suffix for suffix in suffix_texts]
+#     resolved_safe_prompt = build_safe_prompt(harm_prompt, mapping=mapping_dict, safe_prompt_from_data=safe_prompt)
+#     safe_prompts = [resolved_safe_prompt] * len(harm_prompts)
+#
+#     # 对齐输入长度
+#     harm_inputs = target_tokenizer(
+#         harm_prompts,
+#         return_tensors='pt',
+#         padding='max_length',
+#         max_length=max_length,
+#         truncation=True
+#     ).to(target_device)
+#     safe_inputs = target_tokenizer(
+#         safe_prompts,
+#         return_tensors='pt',
+#         padding='max_length',
+#         max_length=max_length,
+#         truncation=True
+#     ).to(target_device)
+#
+#     # 模型推理得到logits（去掉最后一个token以便于教师强制）
+#     harm_out = target_model(**harm_inputs)
+#     safe_out = target_model(**safe_inputs)
+#
+#     harm_logits = harm_out.logits[:, :-1, :]
+#     safe_logits = safe_out.logits[:, :-1, :]
+#
+#     # 获取目标模型的嵌入层
+#     embedding_layer = target_model.get_input_embeddings()
+#
+#     # 如果未提供拒绝词ID，则使用默认的几个示例拒绝词
+#     if bad_word_ids is None:
+#         default_bad_words = ['sorry', 'cannot', 'unethical', 'illegal']
+#         bad_word_ids = []
+#         for word in default_bad_words:
+#             ids = target_tokenizer.encode(word, add_special_tokens=False)
+#             bad_word_ids.extend(ids)
+#         bad_word_ids = list(set(bad_word_ids))
+#
+#     # 使用 compute_semantic_reject_loss 计算 harm 与 safe 两端的语义拒绝损失
+#     harm_loss = compute_semantic_reject_loss(harm_logits, bad_word_ids, embedding_layer, threshold=threshold)
+#     safe_loss = compute_semantic_reject_loss(safe_logits, bad_word_ids, embedding_layer, threshold=threshold)
+#
+#     # 可选：计算 KL 散度
+#     if use_kl:
+#         harm_probs = F.softmax(harm_logits, dim=-1)
+#         safe_probs = F.softmax(safe_logits, dim=-1)
+#         kl_loss = F.kl_div(harm_probs.log(), safe_probs, reduction='batchmean')
+#     else:
+#         kl_loss = 0.0
+#
+#     # 组合损失：差值越低，说明 harm 端越容易回答（语义上更远离拒绝词）
+#     adv_loss = (harm_loss - safe_loss) + kl_loss
+#
+#     return ReturnStruct(
+#         loss=adv_loss.to(proxy_device),
+#         pred=pred_ids.to(proxy_device)
+#     )
+
+#
+# def compute_adv_loss_from_safe_baseline_min_gap(
+#     y_logits_,
+#     harm_prompt: str,
+#     proxy_tokenizer,
+#     target_model,
+#     target_tokenizer,
+#     safe_prompt: str = None,
+#     loss_params: dict = None,
+#     mapping_dict: dict = None,
+#     proxy_device="cuda:0",
+#     target_device="cuda:1",
+#     max_length=128,  # 新增参数
+#     use_kl=False      # 是否启用 KL 散度
+# ):
+#     if loss_params is None:
+#         loss_params = {"hard_labels": True, "reweight_loss": False, "reduction": "none"}
+#
+#     # 解码扰动后缀
+#     with torch.device(proxy_device):
+#         pred_ids = torch.argmax(y_logits_, dim=-1)
+#         suffix_texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True) for ids in pred_ids]
+#     # print("resolved_safe_prompt")
+#     harm_prompts = [harm_prompt + suffix for suffix in suffix_texts]
+#     safe_prompts = [build_safe_prompt(harm_prompt, mapping=mapping_dict, safe_prompt_from_data=safe_prompt) + suffix for suffix in suffix_texts]
+#
+#     # 对齐输入长度
+#     harm_inputs = target_tokenizer(
+#         harm_prompts,
+#         return_tensors='pt',
+#         padding='max_length',  # 填充到统一长度
+#         max_length=max_length,  # 显式指定最大长度
+#         truncation=True
+#     ).to(target_device)
+#     safe_inputs = target_tokenizer(
+#         safe_prompts,
+#         return_tensors='pt',
+#         padding='max_length',
+#         max_length=max_length,
+#         truncation=True
+#     ).to(target_device)
+#
+#     # 模型推理
+#     harm_out = target_model(**harm_inputs)
+#     safe_out = target_model(**safe_inputs)
+#
+#     # 取 logits（自动对齐长度）
+#     harm_logits = harm_out.logits[:, :-1, :]
+#     safe_logits = safe_out.logits[:, :-1, :]
+#
+#     # 计算交叉熵损失
+#     harm_loss = F.cross_entropy(harm_logits.transpose(1, 2), harm_inputs['input_ids'][:, 1:], reduction='none')
+#     safe_loss = F.cross_entropy(safe_logits.transpose(1, 2), safe_inputs['input_ids'][:, 1:], reduction='none')
+#
+#     # 计算 KL 散度（可选）
+#     if use_kl:
+#         harm_probs = F.softmax(harm_logits, dim=-1)
+#         safe_probs = F.softmax(safe_logits, dim=-1)
+#         kl_loss = F.kl_div(harm_probs.log(), safe_probs, reduction='batchmean')
+#     else:
+#         kl_loss = 0.0
+#
+#     # 组合损失
+#     adv_loss = (harm_loss.mean() - safe_loss.mean()) + kl_loss
+#
+#     return ReturnStruct(
+#         loss=adv_loss.to(proxy_device),
+#         pred=pred_ids.to(proxy_device)
+#     )
 
 
 def compute_remiss_style_adv_loss(
