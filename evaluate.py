@@ -588,7 +588,7 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=1, help="loading data from ith examples.")
     parser.add_argument("--end", type=int, default=10, help="loading data util ith examples.")
 
-    parser.add_argument("--num-iters", type=float, default=2000)
+    parser.add_argument("--num-iters", type=int, default=2000)
     parser.add_argument("--cw_weight", type=float, default=100.0)
     parser.add_argument("--kl_max_weight", type=float, default=100.0)
     parser.add_argument("--goal-weight", type=float, default=100.0)
