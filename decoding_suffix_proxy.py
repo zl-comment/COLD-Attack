@@ -14,7 +14,7 @@ import logging
 import os
 import traceback
 from datetime import datetime
-from transformers import DynamicCache
+from transformers import DynamicCache, DistilBertForSequenceClassification
 from nltk import tokenize
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
@@ -22,10 +22,11 @@ from nltk.tokenize import word_tokenize
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from award.reaward import compute_adv_loss_from_safe_baseline_min_gap, build_safe_prompt, compute_cw_loss, \
-    compute_semantic_reject_loss, compute_rejection_prob_loss, get_reject_token_ids
+    compute_semantic_reject_loss, compute_rejection_prob_loss, get_reject_token_ids, compute_adv_loss_optimized_v1
 from model.Apimodel import  call_api_completion
 from model.use_distilled_model import load_model
 from opt_util import load_model_and_tokenizer
+from award.utils import ReturnStruct
 from util import *
 #新添加的import
 import torch
@@ -159,15 +160,14 @@ def filter_logits_for_target_model(logits, target_vocab_size, target_vocab):
     return mapped_logits.long()
 
 
-def decode(target_model_path, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
+def decode(target_model, target_tokenizer,proxy_model, proxy_tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
            model_back=None, zz=None):
 
 
     torch.cuda.empty_cache()
 
-    # 加载代理模型
-    proxy_model, proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device)
-    text, _, last_text_ids = decode_proxy_little(target_model_path, proxy_model, proxy_tokenizer, device, x, z,
+
+    text, _, last_text_ids = decode_proxy_little(target_model, target_tokenizer, proxy_model, proxy_tokenizer, device, x, z,
                                                  constraints, args, sys_prompt, prefix, model_back, zz)
 
     # 清理代理模型 GPU 内存
@@ -365,7 +365,7 @@ def decode(target_model_path, device, x="", z="", constraints=None, args=None, s
 # #
 
 
-def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
+def decode_proxy_little(target_model, target_tokenizer,proxy_model, proxy_tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
                           model_back=None, zz=None):
     """
     x: left context (prompt in lexical task)
@@ -376,9 +376,10 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     print("启动")
     proxy_model.eval()  # 设置评估模式
     logger = setup_logger(args)
-    if not args.useapi:
-        # 加载目标模型和分词器（目标模型在 cuda:1 上）
-        target_model, target_tokenizer  =  load_model_and_tokenizer(target_model_path,low_cpu_mem_usage=True,use_cache=False,device='cuda:1')
+    # if not args.useapi:
+    #     # 加载目标模型和分词器（目标模型在 cuda:1 上）
+    #     target_model, target_tokenizer  =  load_model_and_tokenizer(target_model_path,low_cpu_mem_usage=True,use_cache=False,device='cuda:1')
+
 
 
     # 不良词汇
@@ -589,6 +590,16 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     # -------------------------------
     # 训练循环
     # -------------------------------
+    # 二分类判断
+    # 6. 加载二分类器（提前加载可优化性能）
+    classifier = DistilBertForSequenceClassification.from_pretrained(
+        '/home/zl/ZLCODE/model/distilbert-base-uncased'
+    ).to(target_model.device)
+    classifier.load_state_dict(
+        torch.load("/home/zl/ZLCODE/COLD-Attack/award/distilbert_suffix.pt",
+                   map_location=target_model.device)
+    )
+    classifier.eval()
 
     for ite in pbar:
         optim.zero_grad()
@@ -675,7 +686,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             target_tokenizer,
             target_model.device,
             reject_token_ids  # 传入预计算的拒绝 token IDs
-        )
+        ).to(device)
 
 
 
@@ -698,10 +709,24 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             print("Warning: KL loss is NaN, resetting to zero")
             kl_loss = torch.zeros_like(kl_loss)
 
+
+
+        #
+        # ret_struct = compute_adv_loss_optimized_v1(
+        #     y_logits_,
+        #     harm_prompt=sys_prompt + x,
+        #     proxy_tokenizer=proxy_tokenizer,
+        #     target_model=target_model,
+        #     target_tokenizer=target_tokenizer,
+        #     classifier=classifier,
+        #     safe_prompt=build_safe_prompt(sys_prompt + x),
+        #     proxy_device=proxy_model.device,
+        #     target_device=target_model.device
+        # )
         # if ite < 1000:
             #使用教师强制学习和交叉熵loss
     # #输入y_logits_ proxy_tokenizer target_model target_tokenizer
-    #     ReturnStruct=compute_adv_loss(
+    #     ret_struct =compute_adv_loss(
     #         y_logits_,
     #         proxy_tokenizer,
     #         target_model,
@@ -710,18 +735,9 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     #         proxy_device=proxy_model.device,
     #         target_device=target_model.device
     #     )
-        ReturnStruct = compute_adv_loss_from_safe_baseline_min_gap(
-            y_logits_,
-            harm_prompt=sys_prompt + x,
-            proxy_tokenizer=proxy_tokenizer,
-            target_model=target_model,
-            target_tokenizer=target_tokenizer,
-            safe_prompt=build_safe_prompt(sys_prompt + x),
-            proxy_device=proxy_model.device,
-            target_device=target_model.device,
-        )
 
-        # print("ReturnStruct:",ReturnStruct)
+
+        # print("ret_struct :",ret_struct )
         # progress = ite / args.num_iters
         # flu_weight = 100*(  1.0 + 0.4 * progress)
         # kl_loss_weight =  args.kl_max_weight * (1.0 - 0.3 * progress)
@@ -732,20 +748,76 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         # 动态权重设置
         progress = ite / args.num_iters
         flu_weight = 50 * (1.0 + 0.2 * progress)  # 适当降低流畅性权重
-        rej_weight = args.rej_weight * (1.0 + 0.5 * progress)  # 增加拒绝相关损失权重
-        Re_weight = 1000 * (1.0 + 0.5 * progress)  # 大幅增加ReturnStruct权重
-        kl_loss_weight = args.kl_max_weight*10 * (1.0 - 0.3 * progress)  # 随着训练进行减小语义拒绝损失权重
+        rej_weight = args.rej_weight * (1.0 + 0.3 * progress)  # 增加拒绝相关损失权重
+        # Re_weight = 100 * (1.0 + 0.5 * progress)  # 大幅增加ReturnStruct权重
+        kl_loss_weight = args.kl_max_weight*10 * (1.0 + 0.3 * progress)  # 随着训练进行减小语义拒绝损失权重
         goal_weight = args.goal_weight * (1.0 + 0.3 * progress)  # 增加目标文本相似度权重
-        cw_weight = args.cw_weight * (1.0 + 0.5 * progress)  # 增加CW损失权重
+        # cw_weight = args.cw_weight * (1.0 + 0.5 * progress)  # 增加CW损失权重
+        # 假设 warmup_iters 占总迭代数的 30%
+        # warmup_iters = args.num_iters * 0.3
+        #
+        # if ite < warmup_iters:
+        #     # 预热阶段：注重流畅性和拒绝词
+        #     progress = ite / warmup_iters  # 0~1
+        #     flu_weight = 50 * (1.0 + 0.2 * progress)  # 流畅性权重随预热进度逐渐上升
+        #     rej_weight = args.rej_weight * (1.0 + 0.3 * progress)  # 拒绝相关损失权重也随预热进度上升
+        #     Re_weight = 100  # 预热阶段保持较低的对抗损失权重
+        #     goal_weight = args.goal_weight * (1.0 + 0.3 * progress)
+        # else:
+        #     # 攻击阶段：保持流畅性和拒绝损失稳定，开始加大对抗损失权重
+        #     progress_attack = (ite - warmup_iters) / (args.num_iters - warmup_iters)  # 0~1
+        #     flu_weight = 50  # 固定（或者你也可以逐渐衰减）
+        #     rej_weight = args.rej_weight  # 固定
+        #     # Re_weight 从预热阶段的基础值 100 开始线性上升，例如最高可达 100 * (1+0.5)=150（你可以根据实际情况调整上升幅度）
+        #     Re_weight = 100 * (1.0 + 0.5 * progress_attack)
+        #     goal_weight = args.goal_weight * (1.0 + 0.3 * progress_attack)
+
         #1.全+     全生成的是拒绝
         #2.（- Re_weight * ReturnStruct.loss）
         #这个参数图还可以 但是结果只有一半不到成功
         # loss =goal_weight * c_loss_1 + flu_weight * flu_loss + 100 * reject_loss.to(device) - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device) + cw_weight *  cw_loss - Re_weight * ReturnStruct.loss
         #这个比上一个图低一点 结果一半成功
         # loss =goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device)  - Re_weight * ReturnStruct.loss
-        loss =goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device)  + Re_weight * ReturnStruct.loss
+
+        # loss = goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device)  + Re_weight * ret_struct.loss
+        # 计算各个分项损失
+        loss1 = goal_weight * c_loss_1  # 目标文本相似度损失
+        loss2 = flu_weight * flu_loss  # 流畅性损失
+        loss3 = - rej_weight * c_loss_2  # BLEU/约束相关损失（注意这里是负的）
+        loss4 = kl_loss_weight * sem_loss.to(device)  # 语义拒绝/KL损失
+        loss5 = 100 * reject_loss  # 拒绝概率损失
+
+        # loss = goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device)  + 100 * reject_loss
+        # 总损失
+        loss_total = loss1 + loss2 + loss3 + loss4 + loss5
+
+        # grad1 = torch.autograd.grad(loss1.mean(), epsilon, retain_graph=True)[0]
+        # grad2 = torch.autograd.grad(loss2.mean(), epsilon, retain_graph=True)[0]
+        # grad3 = torch.autograd.grad(loss3.mean(), epsilon, retain_graph=True)[0]
+        # grad4 = torch.autograd.grad(loss4.mean(), epsilon, retain_graph=True)[0]
+        # grad5 = torch.autograd.grad(loss5.mean(), epsilon, retain_graph=True)[0]
+
+        # 计算总梯度
+        # total_grad = torch.autograd.grad(loss_total, epsilon, retain_graph=True)[0]
+        # 计算各梯度的 L2 范数
+        # norm1 = grad1.norm().item()
+        # norm2 = grad2.norm().item()
+        # norm3 = grad3.norm().item()
+        # norm4 = grad4.norm().item()
+        # norm5 = grad5.norm().item()
+
+        # # 定义余弦相似度计算函数
+        # def cosine_similarity(a, b):
+        #     return (a.flatten() @ b.flatten()) / (a.norm() * b.norm() + 1e-8)
+
+        # cos_sim1 = cosine_similarity(grad1, total_grad).item()
+        # cos_sim2 = cosine_similarity(grad2, total_grad).item()
+        # cos_sim3 = cosine_similarity(grad3, total_grad).item()
+        # cos_sim4 = cosine_similarity(grad4, total_grad).item()
+        # cos_sim5 = cosine_similarity(grad5, total_grad).item()
+        # loss =goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2  + Re_weight * ReturnStruct.loss
         # loss = F.softplus(loss)
-        loss = loss.mean()
+        loss = loss_total.mean()
         # l2_reg = torch.norm(epsilon) * 0.01
         # loss += l2_reg
         accumulation_steps = 5
@@ -780,15 +852,25 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         if args.wandb:
             wandb_step = ite + 1
             wandb.log({
+                # "grad_norm/goal_weight * c_loss_1": norm1,
+                # "grad_norm/flu_weight * flu_loss": norm2,
+                # "grad_norm/-rej_weight * c_loss_2": norm3,
+                # "grad_norm/kl_loss_weight * sem_loss": norm4,
+                # "grad_norm/100 * reject_loss": norm5,
+                # "grad_cos/goal_weight * c_loss_1": cos_sim1,
+                # "grad_cos/flu_weight * flu_loss": cos_sim2,
+                # "grad_cos/-rej_weight * c_loss_2": cos_sim3,
+                # "grad_cos/kl_loss_weight * sem_loss": cos_sim4,
+                # "grad_cos/100 * reject_loss": cos_sim5,
                 'loss/total': loss.item(),
                 'loss/fluency': flu_weight * flu_loss.mean().item(),
                 'loss/target': goal_weight *  c_loss_1.mean().item(),
                 # 'loss/cw': cw_loss.mean().item(),
                 'loss/bleu': rej_weight * c_loss_2.mean().item(),
-                # 'loss/reject': reject_loss.mean().item(),
+                'loss/reject': 100 * reject_loss.mean().item(),
                 # 'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
                 'loss/kl_sm': kl_loss_weight * sem_loss.mean().item(),
-                'loss/ Critic': Re_weight * ReturnStruct.loss.mean().item(),
+                # 'loss/ Critic': Re_weight * ret_struct .loss.mean().item(),
                 'progress': progress,
                 'weights/goal': goal_weight,
                 'weights/fluency': flu_weight,
