@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import time
 from award.utils import ReturnStruct
 from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
+from transformers import logging
 # -----------------------------------------
 # 1. 定义辅助函数（分词、编辑距离、SWES、奖励计算、动态温度）
 # -----------------------------------------
@@ -109,22 +110,52 @@ def compute_cw_loss(z_logits, z_t, topk=5, margin=1.0):
     topk_logits = other_logits.topk(topk, dim=-1).values  # 取 Top-K 非目标 logits
     cw_loss = F.relu(topk_logits - target_logits.unsqueeze(-1) + margin).mean()  # 多 token 对比
     return cw_loss
-
-def compute_semantic_reject_loss(y_logits, bad_word_ids, embedding_layer, threshold=0.8):
+#
+# def compute_semantic_reject_loss(y_logits, bad_word_ids, embedding_layer, threshold=0.8):
+#     """
+#     y_logits: [batch, seq_len, vocab_size]
+#     bad_word_ids: List[int] 一维的拒绝词 ID 列表（如 [1, 7423, 27746]）
+#     embedding_layer: 代理模型的 token 嵌入层
+#     """
+#     # 检查输入合法性
+#     assert isinstance(bad_word_ids, list), "bad_word_ids 必须是 List[int]"
+#     assert all(isinstance(x, int) for x in bad_word_ids), "bad_word_ids 必须全为整数"
+#
+#     # 获取预测 token 的嵌入
+#     pred_ids = torch.argmax(y_logits, dim=-1)  # [batch, seq_len]
+#     pred_embeddings = embedding_layer(pred_ids)  # [batch, seq_len, emb_dim]
+#
+#     # 获取拒绝词的嵌入（处理梯度警告）
+#     with torch.no_grad():
+#         bad_tensor = torch.tensor(bad_word_ids, device=y_logits.device)
+#         bad_embeddings = embedding_layer(bad_tensor)  # [num_bad, emb_dim]
+#
+#     # 调整维度以支持广播
+#     pred_emb = pred_embeddings.unsqueeze(2)  # [batch, seq_len, 1, emb_dim]
+#     bad_emb = bad_embeddings.unsqueeze(0).unsqueeze(0)  # [1, 1, num_bad, emb_dim]
+#
+#     # 计算余弦相似度（自动广播）
+#     sim = F.cosine_similarity(pred_emb, bad_emb, dim=-1)  # [batch, seq_len, num_bad]
+#
+#     # 惩罚高相似度
+#     return F.relu(sim.max(dim=-1).values - threshold).mean()
+def compute_semantic_reject_loss(y_logits, bad_word_ids, embedding_layer, threshold=0.4, temperature=0.7):
     """
     y_logits: [batch, seq_len, vocab_size]
     bad_word_ids: List[int] 一维的拒绝词 ID 列表（如 [1, 7423, 27746]）
     embedding_layer: 代理模型的 token 嵌入层
+    temperature: 控制 softmax 的温度，值越低，接近 argmax；默认1.0
     """
     # 检查输入合法性
     assert isinstance(bad_word_ids, list), "bad_word_ids 必须是 List[int]"
     assert all(isinstance(x, int) for x in bad_word_ids), "bad_word_ids 必须全为整数"
 
-    # 获取预测 token 的嵌入
-    pred_ids = torch.argmax(y_logits, dim=-1)  # [batch, seq_len]
-    pred_embeddings = embedding_layer(pred_ids)  # [batch, seq_len, emb_dim]
+    # 通过 softmax 加权求和来获得预测 token 的嵌入（软化的 argmax）
+    probs = F.softmax(y_logits / temperature, dim=-1)  # [batch, seq_len, vocab_size]
+    # 利用 embedding_layer.weight 得到整个词汇表的嵌入矩阵，形状为 [vocab_size, emb_dim]
+    pred_embeddings = torch.matmul(probs, embedding_layer.weight)  # [batch, seq_len, emb_dim]
 
-    # 获取拒绝词的嵌入（处理梯度警告）
+    # 获取拒绝词的嵌入（这里依然用 no_grad 保证拒绝词嵌入不参与梯度更新）
     with torch.no_grad():
         bad_tensor = torch.tensor(bad_word_ids, device=y_logits.device)
         bad_embeddings = embedding_layer(bad_tensor)  # [num_bad, emb_dim]
@@ -136,7 +167,8 @@ def compute_semantic_reject_loss(y_logits, bad_word_ids, embedding_layer, thresh
     # 计算余弦相似度（自动广播）
     sim = F.cosine_similarity(pred_emb, bad_emb, dim=-1)  # [batch, seq_len, num_bad]
 
-    # 惩罚高相似度
+    # 对高相似度进行惩罚：取每个 token 对所有拒绝词相似度的最大值，
+    # 超过阈值部分产生损失
     return F.relu(sim.max(dim=-1).values - threshold).mean()
 
 DEFAULT_HARM_SAFE_MAPPING = {
@@ -200,41 +232,42 @@ def build_safe_prompt(harm_prompt: str, mapping: dict = None, safe_prompt_from_d
 
     return safe_prompt
 
-
 def compute_adv_loss_from_safe_baseline_min_gap(
-    y_logits_,
-    harm_prompt: str,
-    proxy_tokenizer,
-    target_model,
-    target_tokenizer,
-    safe_prompt: str = None,
-    loss_params: dict = None,
-    mapping_dict: dict = None,
-    proxy_device="cuda:0",
-    target_device="cuda:1",
-    max_length=128,           # 输入最大长度，用于编码 prompt
-    use_kl=False,             # 是否启用 KL 散度
-    classify_token_length=15  # 用于二分类器的生成文本中新生成的 token 数量（比如 10 或 15）
+        y_logits_,
+        harm_prompt: str,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        classifier,
+        safe_prompt: str = None,
+        loss_params: dict = None,
+        mapping_dict: dict = None,
+        proxy_device="cuda:0",
+        target_device="cuda:1",
+        max_length=128,
+        classify_token_length=128,
+        debug=True
 ):
+    """
+    优化目标：让 target_model 生成的文本被二分类器判定为有害（类别0）
+    返回的 loss 越小表示攻击越成功（有害概率越高）
+    """
+    logging.set_verbosity_error()
+
+    # 1. 初始化设置
     if target_tokenizer.pad_token_id is None:
         target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
 
-
-
-    if loss_params is None:
-        loss_params = {"hard_labels": True, "reweight_loss": False, "reduction": "none"}
-
-    # 1. 解码扰动后缀（保持原有流程）
+    # 2. 解码对抗后缀
     with torch.device(proxy_device):
         pred_ids = torch.argmax(y_logits_, dim=-1)
         suffix_texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True) for ids in pred_ids]
 
-    # 2. 拼接 harm_prompt 与扰动后缀，构成 harm+后缀 文本；同时构造安全端文本（利用 build_safe_prompt 构造安全提示）
+    # 3. 构建完整prompt
     harm_prompts = [harm_prompt + suffix for suffix in suffix_texts]
-    resolved_safe_prompt = build_safe_prompt(harm_prompt, mapping=mapping_dict, safe_prompt_from_data=safe_prompt)
-    safe_prompts = [resolved_safe_prompt for _ in harm_prompts]
 
-    # 3. 对齐输入长度并编码为 target_model 的输入
+
+    # 4. 编码并生成文本
     harm_inputs = target_tokenizer(
         harm_prompts,
         return_tensors='pt',
@@ -242,79 +275,48 @@ def compute_adv_loss_from_safe_baseline_min_gap(
         max_length=max_length,
         truncation=True
     ).to(target_device)
-    safe_inputs = target_tokenizer(
-        safe_prompts,
-        return_tensors='pt',
-        padding='max_length',
-        max_length=max_length,
-        truncation=True
-    ).to(target_device)
 
-    # 4. 使用 target_model 生成文本，注意使用 max_new_tokens 生成新增的 token 部分
-    generated_harm_ids = target_model.generate(
-        **harm_inputs,
-        max_new_tokens=classify_token_length,
-        do_sample=False,  # 强制使用贪心搜索
-        pad_token_id=target_tokenizer.pad_token_id  # 确保pad_token_id正确设置
-    )
-    generated_safe_ids = target_model.generate(
-        **safe_inputs,
-        max_new_tokens=classify_token_length,
-        do_sample=False,
-        pad_token_id=target_tokenizer.pad_token_id
-    )
+    # 5. 生成新tokens（只关注新生成部分）
+    with torch.no_grad():
+        generated_ids = target_model.generate(
+            **harm_inputs,
+            max_new_tokens=classify_token_length,
+            do_sample=True,
+            temperature=0.7,
+            pad_token_id=target_tokenizer.pad_token_id,
+            top_k = 10
+        )
+    new_tokens = generated_ids[:, harm_inputs.input_ids.shape[1]:]
+    # start_index = 50
+    # end_index = 70
+    # new_tokens = new_tokens[:, start_index:end_index]
 
-    # 5. 提取新增生成的 token（即剔除 prompt 部分），作为二分类器输入
-    harm_prompt_length = harm_inputs.input_ids.shape[1]
-    safe_prompt_length = safe_inputs.input_ids.shape[1]
-    harm_new_tokens = generated_harm_ids[:, harm_prompt_length:]
-    safe_new_tokens = generated_safe_ids[:, safe_prompt_length:]
+    new_tokens = new_tokens[:, :classify_token_length]  # 截取固定长度
+    attention_mask = (new_tokens != target_tokenizer.pad_token_id).long()
 
-    # 如果生成的 token 数不足 classify_token_length，则进行截断或补齐处理（此处假设生成数量足够）
-    harm_class_ids = harm_new_tokens[:, :classify_token_length]
-    safe_class_ids = safe_new_tokens[:, :classify_token_length]
-    harm_attention_mask = (harm_class_ids != target_tokenizer.pad_token_id).long()
-    safe_attention_mask = (safe_class_ids != target_tokenizer.pad_token_id).long()
-
-    # 6. 加载微调后的二分类器（distilbert_suffix.pt）
-    # 采用如下方式加载：先构造预训练模型，再加载 state_dict
-    classifier = DistilBertForSequenceClassification.from_pretrained('/home/zl/ZLCODE/model/distilbert-base-uncased')
-    classifier.load_state_dict(torch.load("/home/zl/ZLCODE/COLD-Attack/award/distilbert_suffix.pt", map_location=target_device))
-    classifier.to(target_device)
+    # 6. 加载二分类器（提前加载可优化性能）
     classifier.eval()
 
-    # 7. 使用二分类器得到 logits，形状为 (batch, 2)
-    #    规则：若 logits 中 v[0] > v[1] 则判定为有害
-    v_harm = classifier(input_ids=harm_class_ids, attention_mask=harm_attention_mask).logits
-    v_safe = classifier(input_ids=safe_class_ids, attention_mask=safe_attention_mask).logits
+    # 7. 计算有害概率（核心优化目标）
+    with torch.no_grad():
+        logits = classifier(new_tokens, attention_mask=attention_mask).logits
+        harm_probs = torch.softmax(logits, dim=-1)[:, 0]  # 类别0的概率
+        print("harm_probs:", harm_probs)
 
-    # 8. 计算交叉熵损失：
-    #    harm 分支目标标签为 0（有害），safe 分支目标标签为 1（安全）
-    criterion = torch.nn.CrossEntropyLoss(reduction='none')
-    harm_targets = torch.zeros(v_harm.size(0), dtype=torch.long).to(target_device)
-    safe_targets = torch.zeros(v_safe.size(0), dtype=torch.long).to(target_device)
-    harm_loss = criterion(v_harm, harm_targets)  # 每个样本的损失
-    safe_loss = criterion(v_safe, safe_targets)
+    if debug:
+        print(f"有害概率统计: min={harm_probs.min().item():.3f}, "
+              f"max={harm_probs.max().item():.3f}, "
+              f"mean={harm_probs.mean().item():.3f}")
+        # decoded_text = target_tokenizer.decode(new_tokens[0], skip_special_tokens=True)
+        # print(f"生成文本示例: {decoded_text}")
 
-    # 9. 可选：计算 KL 散度（这里采用 harm 与 safe 分支在 target_model 前向传播得到的输出）
-    if use_kl:
-        harm_forward = target_model(**harm_inputs)
-        safe_forward = target_model(**safe_inputs)
-        # 去除最后一个 token（与原来保持一致）
-        harm_logits = harm_forward.logits[:, :-1, :]
-        safe_logits = safe_forward.logits[:, :-1, :]
-        harm_probs = F.softmax(harm_logits, dim=-1)
-        safe_probs = F.softmax(safe_logits, dim=-1)
-        kl_loss = F.kl_div(harm_probs.log(), safe_probs, reduction='batchmean')
-    else:
-        kl_loss = 0.0
-
-    # 10. 组合损失：目标为让 harm 分支（经对抗生成后）越来越趋向不安全（即 harm_loss 降低），而 safe 分支损失较大
-    adv_loss = (harm_loss - safe_loss).mean() + kl_loss
+    # 8. 设计损失函数：我们希望 harm_probs 越大越好 → 用 -log(p) 作为损失
+    adv_loss = -torch.log(harm_probs + 1e-8).mean()  # 避免log(0)
 
     return ReturnStruct(
         loss=adv_loss.to(proxy_device),
-        pred=pred_ids.to(proxy_device)
+        pred=pred_ids.to(proxy_device),
+        extra_metrics={"harm_prob_mean": harm_probs.mean().item()}  # 监控指标
     )
 
 
@@ -474,77 +476,190 @@ def compute_adv_loss_from_safe_baseline_min_gap(
 #     )
 
 
-def compute_remiss_style_adv_loss(
-    y_logits_,
-    proxy_tokenizer,
-    target_model,
-    target_tokenizer,
-    baseprompt,                     # base prompt: 原始 harmful prompt
-    loss_params=None,
-    proxy_device="cuda:0",
-    target_device="cuda:1",
+# def compute_remiss_style_adv_loss(
+#     y_logits_,
+#     proxy_tokenizer,
+#     target_model,
+#     target_tokenizer,
+#     baseprompt,                     # base prompt: 原始 harmful prompt
+#     loss_params=None,
+#     proxy_device="cuda:0",
+#     target_device="cuda:1",
+# ):
+#     """
+#     结合 reMissOpt 和 compute_base_loss 的对抗奖励函数。
+#     返回完整结构（disturbed_loss, baseline_loss, adv_loss）。
+#     """
+#
+#     if loss_params is None:
+#         loss_params = {
+#             'hard_labels': True,
+#             'reweight_loss': False,
+#         }
+#
+#     target_model = target_model.to(target_device)
+#
+#     # 1. 解码扰动 token -> suffix text
+#     with torch.device(proxy_device):
+#         pred_ids = torch.argmax(y_logits_, dim=-1)  # (B, T)
+#         suffix_texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True) for ids in pred_ids]
+#
+#     # 2. 拼接 harmful prompt + suffix
+#     if isinstance(baseprompt, str):
+#         prompts = [baseprompt + suffix for suffix in suffix_texts]
+#         base_prompts = [baseprompt] * len(suffix_texts)
+#     else:
+#         prompts = [bp + suffix for bp, suffix in zip(baseprompt, suffix_texts)]
+#         base_prompts = baseprompt
+#
+#     # 3. tokenizer 编码，送入目标模型（扰动后的输入）
+#     disturbed_inputs = target_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+#     disturbed_inputs = {k: v.to(target_device) for k, v in disturbed_inputs.items()}
+#
+#     baseline_inputs = target_tokenizer(base_prompts, return_tensors="pt", padding=True, truncation=True)
+#     baseline_inputs = {k: v.to(target_device) for k, v in baseline_inputs.items()}
+#
+#     # 4. 使用 teacher forcing 计算两组 loss
+#     with torch.no_grad():
+#         disturbed_outputs = target_model(
+#             input_ids=disturbed_inputs["input_ids"],
+#             attention_mask=disturbed_inputs["attention_mask"],
+#             labels=disturbed_inputs["input_ids"]
+#         )
+#         disturbed_loss_batch = disturbed_outputs.loss
+#
+#         baseline_outputs = target_model(
+#             input_ids=baseline_inputs["input_ids"],
+#             attention_mask=baseline_inputs["attention_mask"],
+#             labels=baseline_inputs["input_ids"]
+#         )
+#         baseline_loss_batch = baseline_outputs.loss
+#
+#     # 5. 计算对抗差异 reward
+#     adv_loss = disturbed_loss_batch - baseline_loss_batch
+#
+#     return ReturnStruct(
+#         loss=adv_loss.to(proxy_device),
+#         disturbed_loss=disturbed_loss_batch.to(proxy_device),
+#         baseline_loss=baseline_loss_batch.to(proxy_device),
+#         pred=pred_ids.to(proxy_device),  # 这个 pred 实际是 suffix 的 token ids
+#         label=disturbed_inputs["input_ids"][:, 1:].to(proxy_device),
+#         mask=disturbed_inputs["attention_mask"][:, 1:].to(proxy_device),
+#     )
+#
+def compute_adv_loss_optimized_v1(
+        y_logits_,
+        harm_prompt: str,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        classifier,
+        safe_prompt: str = None,
+        loss_params: dict = None,
+        mapping_dict: dict = None,
+        proxy_device="cuda:0",
+        target_device="cuda:1",
+        max_length=128,
+        classify_token_length=30,
+        debug=True
 ):
     """
-    结合 reMissOpt 和 compute_base_loss 的对抗奖励函数。
-    返回完整结构（disturbed_loss, baseline_loss, adv_loss）。
+    极致优化版本，特点：
+    1. 完全批处理，无循环
+    2. 最小化设备间传输
+    3. 异步计算和内存优化
+    4. 自适应窗口策略
     """
+    # 1. 初始化设置（保持与之前相同）
+    if target_tokenizer.pad_token_id is None:
+        target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
 
-    if loss_params is None:
-        loss_params = {
-            'hard_labels': True,
-            'reweight_loss': False,
-        }
-
-    target_model = target_model.to(target_device)
-
-    # 1. 解码扰动 token -> suffix text
-    with torch.device(proxy_device):
-        pred_ids = torch.argmax(y_logits_, dim=-1)  # (B, T)
-        suffix_texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True) for ids in pred_ids]
-
-    # 2. 拼接 harmful prompt + suffix
-    if isinstance(baseprompt, str):
-        prompts = [baseprompt + suffix for suffix in suffix_texts]
-        base_prompts = [baseprompt] * len(suffix_texts)
-    else:
-        prompts = [bp + suffix for bp, suffix in zip(baseprompt, suffix_texts)]
-        base_prompts = baseprompt
-
-    # 3. tokenizer 编码，送入目标模型（扰动后的输入）
-    disturbed_inputs = target_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-    disturbed_inputs = {k: v.to(target_device) for k, v in disturbed_inputs.items()}
-
-    baseline_inputs = target_tokenizer(base_prompts, return_tensors="pt", padding=True, truncation=True)
-    baseline_inputs = {k: v.to(target_device) for k, v in baseline_inputs.items()}
-
-    # 4. 使用 teacher forcing 计算两组 loss
+    # 2. 解码对抗后缀（直接在proxy_device上操作）
     with torch.no_grad():
-        disturbed_outputs = target_model(
-            input_ids=disturbed_inputs["input_ids"],
-            attention_mask=disturbed_inputs["attention_mask"],
-            labels=disturbed_inputs["input_ids"]
-        )
-        disturbed_loss_batch = disturbed_outputs.loss
+        pred_ids = torch.argmax(y_logits_, dim=-1)
+        suffix_texts = proxy_tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-        baseline_outputs = target_model(
-            input_ids=baseline_inputs["input_ids"],
-            attention_mask=baseline_inputs["attention_mask"],
-            labels=baseline_inputs["input_ids"]
-        )
-        baseline_loss_batch = baseline_outputs.loss
+    # 3. 构建完整prompt（预分配内存）
+    harm_prompts = [harm_prompt + suffix for suffix in suffix_texts]
 
-    # 5. 计算对抗差异 reward
-    adv_loss = disturbed_loss_batch - baseline_loss_batch
+    # 4. 编码和生成（使用更高效的生成参数）
+    with torch.no_grad():
+        harm_inputs = target_tokenizer(
+            harm_prompts,
+            return_tensors='pt',
+            padding=True,  # 使用动态padding
+            truncation=True,
+            max_length=max_length
+        ).to(target_device)
+
+        # 使用更高效的生成配置
+        generated_ids = target_model.generate(
+            input_ids=harm_inputs.input_ids,
+            attention_mask=harm_inputs.attention_mask,
+            max_new_tokens=classify_token_length,
+            do_sample=True,
+            temperature=0.7,
+            top_k=10,
+            pad_token_id=target_tokenizer.pad_token_id,
+            output_scores=False,  # 不需要scores可以关闭
+            return_dict_in_generate=False  # 简化输出
+        )
+
+        new_tokens = generated_ids[:, harm_inputs.input_ids.size(1):]
+
+    # 5. 优化窗口处理（完全向量化）
+    window_size = 10
+    step = 10  # 更大的步长
+    batch_size, seq_len = new_tokens.shape
+
+    # 使用unfold进行高效滑动窗口
+    if seq_len >= window_size:
+        # 创建所有窗口 (batch, num_windows, window_size)
+        windows = new_tokens.unfold(1, window_size, step)
+        attention_mask = (windows != target_tokenizer.pad_token_id).long()
+
+        # 展平并批量分类
+        flat_windows = windows.reshape(-1, window_size)
+        flat_attention = attention_mask.reshape(-1, window_size)
+
+        # 分块处理大batch以避免OOM
+        chunk_size = 32  # 根据GPU内存调整
+        num_chunks = (flat_windows.size(0) + chunk_size - 1) // chunk_size
+        harm_probs = []
+
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = min((i + 1) * chunk_size, flat_windows.size(0))
+            with torch.no_grad():
+                chunk_logits = classifier(
+                    flat_windows[start:end],
+                    attention_mask=flat_attention[start:end]
+                ).logits
+                chunk_probs = torch.softmax(chunk_logits, dim=-1)[:, 0]
+                harm_probs.append(chunk_probs)
+
+        window_probs = torch.cat(harm_probs).view(batch_size, -1)
+        max_harm_probs, _ = window_probs.max(dim=1)
+    else:
+        attention_mask = (new_tokens != target_tokenizer.pad_token_id).long()
+        with torch.no_grad():
+            logits = classifier(new_tokens, attention_mask=attention_mask).logits
+            max_harm_probs = torch.softmax(logits, dim=-1)[:, 0]
+
+
+    if debug:
+        print(f"有害概率统计: min={max_harm_probs.min().item():.3f}, "
+              f"max={max_harm_probs.max().item():.3f}, "
+              f"mean={max_harm_probs.mean().item():.3f}")
+
+    # 6. 损失计算（保持与之前相同）
+    adv_loss = -torch.log(max_harm_probs + 1e-8).mean()
 
     return ReturnStruct(
         loss=adv_loss.to(proxy_device),
-        disturbed_loss=disturbed_loss_batch.to(proxy_device),
-        baseline_loss=baseline_loss_batch.to(proxy_device),
-        pred=pred_ids.to(proxy_device),  # 这个 pred 实际是 suffix 的 token ids
-        label=disturbed_inputs["input_ids"][:, 1:].to(proxy_device),
-        mask=disturbed_inputs["attention_mask"][:, 1:].to(proxy_device),
+        pred=pred_ids.to(proxy_device),
+        extra_metrics={"harm_prob_mean": max_harm_probs.mean().item()}
     )
-
 
 def compute_base_loss(
         y_logits_,
