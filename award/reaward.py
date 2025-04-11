@@ -153,7 +153,7 @@ def compute_semantic_reject_loss(y_logits, bad_word_ids, embedding_layer, thresh
     # 通过 softmax 加权求和来获得预测 token 的嵌入（软化的 argmax）
     probs = F.softmax(y_logits / temperature, dim=-1)  # [batch, seq_len, vocab_size]
     # 利用 embedding_layer.weight 得到整个词汇表的嵌入矩阵，形状为 [vocab_size, emb_dim]
-    pred_embeddings = torch.matmul(probs, embedding_layer.weight)  # [batch, seq_len, emb_dim]
+    pred_embeddings = torch.matmul(probs.half(), embedding_layer.weight)  # [batch, seq_len, emb_dim]
 
     # 获取拒绝词的嵌入（这里依然用 no_grad 保证拒绝词嵌入不参与梯度更新）
     with torch.no_grad():
@@ -294,8 +294,7 @@ def compute_adv_loss_from_safe_baseline_min_gap(
     new_tokens = new_tokens[:, :classify_token_length]  # 截取固定长度
     attention_mask = (new_tokens != target_tokenizer.pad_token_id).long()
 
-    # 6. 加载二分类器（提前加载可优化性能）
-    classifier.eval()
+
 
     # 7. 计算有害概率（核心优化目标）
     with torch.no_grad():

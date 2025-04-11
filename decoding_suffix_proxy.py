@@ -160,14 +160,16 @@ def filter_logits_for_target_model(logits, target_vocab_size, target_vocab):
     return mapped_logits.long()
 
 
-def decode(target_model, target_tokenizer,proxy_model, proxy_tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
+def decode(target_model_path, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
            model_back=None, zz=None):
 
 
     torch.cuda.empty_cache()
 
 
-    text, _, last_text_ids = decode_proxy_little(target_model, target_tokenizer, proxy_model, proxy_tokenizer, device, x, z,
+    # 加载代理模型
+    proxy_model, proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device)
+    text, _, last_text_ids = decode_proxy_little(target_model_path, proxy_model, proxy_tokenizer, device, x, z,
                                                  constraints, args, sys_prompt, prefix, model_back, zz)
 
     # 清理代理模型 GPU 内存
@@ -365,7 +367,7 @@ def decode(target_model, target_tokenizer,proxy_model, proxy_tokenizer, device, 
 # #
 
 
-def decode_proxy_little(target_model, target_tokenizer,proxy_model, proxy_tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
+def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
                           model_back=None, zz=None):
     """
     x: left context (prompt in lexical task)
@@ -376,9 +378,9 @@ def decode_proxy_little(target_model, target_tokenizer,proxy_model, proxy_tokeni
     print("启动")
     proxy_model.eval()  # 设置评估模式
     logger = setup_logger(args)
-    # if not args.useapi:
-    #     # 加载目标模型和分词器（目标模型在 cuda:1 上）
-    #     target_model, target_tokenizer  =  load_model_and_tokenizer(target_model_path,low_cpu_mem_usage=True,use_cache=False,device='cuda:1')
+    if not args.useapi:
+        # 加载目标模型和分词器（目标模型在 cuda:1 上）
+        target_model, target_tokenizer  =  load_model_and_tokenizer(target_model_path,low_cpu_mem_usage=True,use_cache=False,device='cuda:1')
 
 
 
@@ -592,14 +594,14 @@ def decode_proxy_little(target_model, target_tokenizer,proxy_model, proxy_tokeni
     # -------------------------------
     # 二分类判断
     # 6. 加载二分类器（提前加载可优化性能）
-    classifier = DistilBertForSequenceClassification.from_pretrained(
-        '/home/zl/ZLCODE/model/distilbert-base-uncased'
-    ).to(target_model.device)
-    classifier.load_state_dict(
-        torch.load("/home/zl/ZLCODE/COLD-Attack/award/distilbert_suffix.pt",
-                   map_location=target_model.device)
-    )
-    classifier.eval()
+    # classifier = DistilBertForSequenceClassification.from_pretrained(
+    #     '/home/zl/ZLCODE/model/distilbert-base-uncased'
+    # ).to(target_model.device)
+    # classifier.load_state_dict(
+    #     torch.load("/home/zl/ZLCODE/COLD-Attack/award/distilbert_suffix.pt",
+    #                map_location=target_model.device)
+    # )
+    # classifier.eval()
 
     for ite in pbar:
         optim.zero_grad()
@@ -784,7 +786,7 @@ def decode_proxy_little(target_model, target_tokenizer,proxy_model, proxy_tokeni
         loss1 = goal_weight * c_loss_1  # 目标文本相似度损失
         loss2 = flu_weight * flu_loss  # 流畅性损失
         loss3 = - rej_weight * c_loss_2  # BLEU/约束相关损失（注意这里是负的）
-        loss4 = kl_loss_weight * sem_loss.to(device)  # 语义拒绝/KL损失
+        loss4 = kl_loss_weight * sem_loss  # 语义拒绝/KL损失
         loss5 = 100 * reject_loss  # 拒绝概率损失
 
         # loss = goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device)  + 100 * reject_loss

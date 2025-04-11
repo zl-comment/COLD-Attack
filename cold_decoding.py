@@ -8,9 +8,6 @@ import wandb
 import argparse
 import random
 import sys
-
-from model.model_loader import load_proxy_model
-
 sys.path.insert(0, './GPT2ForwardBackward')
 
 from nltk.corpus import stopwords
@@ -156,18 +153,10 @@ def main():
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
                                                 device=device)
+
+        # Freeze GPT-2 weights
         model.eval()
         for param in model.parameters():
-            param.requires_grad = False
-    elif "proxy" in args.mode:
-        # 加载代理模型
-        proxy_model, proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device)
-        # 加载目标模型和分词器（目标模型在 cuda:1 上）
-        target_model, target_tokenizer = load_model_and_tokenizer(model_path, low_cpu_mem_usage=True,
-                                                                  use_cache=False, device='cuda:1')
-        # Freeze GPT-2 weights
-        target_model.eval()
-        for param in target_model.parameters():
             param.requires_grad = False
 
 
@@ -189,7 +178,7 @@ def main():
         attack_generation(model_path, device, args)
     elif "proxy" in args.mode:
         from attack_suffix_proxy import attack_generation   ##再添加一个代理模型
-        attack_generation(target_model, target_tokenizer,proxy_model, proxy_tokenizer, device, args)
+        attack_generation(model_path, device, args)
 
 
 if __name__ == "__main__":

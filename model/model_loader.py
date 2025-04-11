@@ -80,6 +80,7 @@ def load_proxy_model(
         tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=True,
+            torch_dtype=torch.float16,
             padding_side='left'
         )
 
@@ -118,7 +119,7 @@ def load_proxy_model(
             # 加载模型
             model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16 if device=='cuda' else torch.float32,
+            torch_dtype=torch.float16,
             device_map='auto' if device=='cuda' else None,
             low_cpu_mem_usage = True,
             use_cache = False
