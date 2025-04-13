@@ -96,6 +96,8 @@ def options():
     parser.add_argument("--cw_loss_kappa", type=float, default=0.05)
     parser.add_argument("--useapi", type=bool, default=False)
     parser.add_argument("--api", type=str, default="http://172.20.0.251:8000/v1/completions")
+    #加载数据集的路径
+    parser.add_argument("--data_path", type=str, default="./data/advbench/harmful_behaviors_custom.csv")
 
     args = parser.parse_args()
     return args

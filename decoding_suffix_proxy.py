@@ -14,6 +14,8 @@ import logging
 import os
 import traceback
 from datetime import datetime
+
+import os.path as osp
 from transformers import DynamicCache, DistilBertForSequenceClassification
 from nltk import tokenize
 from nltk.corpus import stopwords
@@ -63,9 +65,10 @@ def setup_logger(args):
     # 检查是否已经配置过日志
     if logging.getLogger().hasHandlers():
         return logging.getLogger()
+    file_name = osp.basename(args.data_path).replace('.csv', '')
 
     # 创建logs目录（如果不存在）
-    log_dir = os.path.join('outputs',args.pretrained_model, args.proxy_model, 'logs')
+    log_dir = os.path.join('outputs',f'{file_name}',args.pretrained_model, args.proxy_model, 'logs')
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 

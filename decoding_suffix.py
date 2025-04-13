@@ -13,7 +13,7 @@ from nltk.tokenize import word_tokenize
 # from evaluation.bert_score import score
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from util import *
-
+import os.path as osp
 import time
 import seaborn as sns
 import copy
@@ -41,7 +41,9 @@ class SuffixManager:
 # 设置日志记录器
 def setup_logger(args):
     # 创建logs目录（如果不存在）
-    log_dir = os.path.join('outputs', 'Llama-2-7b-chat-hf', 'logs')
+    file_name = osp.basename(args.data_path).replace('.csv', '')
+
+    log_dir = os.path.join('outputs',f'{file_name}', args.pretrained_model, 'logs')
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     
@@ -306,7 +308,7 @@ def decode(model, tokenizer, device, x="", z="", constraints=None, args=None, sy
     # 主优化循环
     for iter in tqdm(range(args.num_iters), desc="Processing Goals"):
         # 你的逻辑代码
-        print(f"Processing iteration {iter}")
+        # print(f"Processing iteration {iter}")
         optim.zero_grad()  # 清除梯度
 
         # 将扰动加到logits上

@@ -15,9 +15,10 @@ from decoding_suffix_proxy import decode
 
 
 def attack_generation(target_model_path, device, args, model_back=None, ppl_last=None):
-    data = pd.read_csv("./data/advbench/harmful_behaviors_custom.csv")
+    # data = pd.read_csv("./data/advbench/harmful_behaviors_custom.csv")
+    data = pd.read_csv(args.data_path)
     # data = pd.read_csv("./data/advbench/harmful_behaviors.csv")
-
+    file_name = osp.basename(args.data_path).replace('.csv', '')
     targets = data['target'].tolist()
     goals = data['goal'].tolist()
     #加载LLM系统提示词的
@@ -34,12 +35,10 @@ def attack_generation(target_model_path, device, args, model_back=None, ppl_last
 
     prefix_prompt = DEFAULT_SYSTEM_PROMPT
 
-    fw = f"./outputs/{args.pretrained_model}/"
+    fw = f"./outputs/{file_name}/{args.pretrained_model}/{args.proxy_model}/"
     if not os.path.exists(fw):
         os.makedirs(fw)
-    fw = f"./outputs/{args.proxy_model}/"
-    if not os.path.exists(fw):
-        os.makedirs(fw)
+
 
     procssed = set()
     ppls = []  # 一开始为空
@@ -48,6 +47,7 @@ def attack_generation(target_model_path, device, args, model_back=None, ppl_last
     prompts_with_adv = []
     text_candidates = []
     text_complete_candidates = []
+
     for i, d in enumerate(zip(goals, targets)):
         if i < args.start or i > args.end:
             continue
@@ -92,56 +92,12 @@ def attack_generation(target_model_path, device, args, model_back=None, ppl_last
         print(results)
 
         # 检查文件是否存在
-        if osp.exists(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv"):
+        if osp.exists(f"outputs/{file_name}/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv"):
             # 如果文件存在，直接覆盖写（会覆盖原有内容，写入新内容）
-            results.to_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv", mode='w', header=True)
+            results.to_csv(f"outputs/{file_name}/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv", mode='w', header=True)
         else:
             # 如果文件不存在，创建新文件并写入（会写入列头）
-            results.to_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv", mode='w', header=True)
-        # for _ in range(args.repeat_batch):
-        #     try:
-        #         # 在这里调用 decode 函数，捕获可能的异常
-        #         _, text, text_post, decoded_text, p_with_adv = decode(
-        #             model_path, device, x, z, None, args,
-        #             DEFAULT_SYSTEM_PROMPT, prefix_prompt,
-        #             model_back=model_back, zz=z_keywords
-        #         )
-        #
-        #         # 将返回的结果追加到相应的列表中
-        #         text_candidates.extend(text)
-        #         text_complete_candidates.extend(text_post)
-        #         outputs.extend(decoded_text)
-        #         prompts.extend([x] * args.batch_size)
-        #         prompts_with_adv.extend(p_with_adv)
-        #         ppls.extend(_)
-        #     except Exception as e:
-        #         # 捕获异常并打印错误信息，但不会停止循环
-        #         print(f"Error occurred in iteration {_}: {e}")
-        #         # 继续下一个循环，避免中断程序
-        #         continue
-        #
-        #     # 创建一个 DataFrame 来存储当前迭代的结果
-        #     results = pd.DataFrame()
-        #     results["prompt"] = [line.strip() for line in prompts]
-        #     results["prompt_with_adv"] = prompts_with_adv
-        #     results["output"] = outputs
-        #     results["adv"] = text_complete_candidates
-        #     results["ppl"] = ppls
-        #
-        #     # 打印结果
-        #     print(results)
-        #
-        #     # 保存每个循环的结果
-        #     try:
-        #         # 检查文件是否存在
-        #         if osp.exists(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv"):
-        #             # 如果文件存在，直接覆盖写（会覆盖原有内容，写入新内容）
-        #             results.to_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
-        #         else:
-        #             # 如果文件不存在，创建新文件并写入（会写入列头）
-        #             results.to_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}.csv", mode='w', header=True)
-        #     except Exception as e:
-        #         # 如果在保存时发生异常，捕获并打印错误信息
-        #         print(f"Error occurred while saving the results: {e}")
+            results.to_csv(f"outputs/{file_name}/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv", mode='w', header=True)
+
 
     print("finished")
