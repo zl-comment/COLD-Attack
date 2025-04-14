@@ -418,20 +418,20 @@ def decode(model, tokenizer, device, x="", z="", constraints=None, args=None, sy
             # logger.info(f"[Iter {iter+1}] Learning rate: {last_lr}")
             
         # 定期打印生成结果
-        if args.verbose and ((iter + 1) % args.print_every == 0 or iter == 0 or iter + 1 == args.num_iters):
-            text, _, last_text_ids = decode_with_model_topk(
-                model, y_logits_, args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None, bad_mask=None)
-            text_post = text
-            for bi in range(args.batch_size):
-                prompt = x + " " + text_post[bi]
-                input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-                logger.info("\n Output of the model:\n")
-                output_ids  = model.generate(inputs=input_ids, temperature=0.7, max_length = 512, do_sample=True, top_k=args.topk)
-                
-                logger.info(tokenizer.decode(output_ids[0], skip_special_tokens=True))
-                logger.info(
-                    "%d, loss: %.4f,flu_loss: %.4f, c_loss_1: %.4f, c_loss_2: %.4f, lr: %.4f, |%s|" % (
-                        iter + 1, loss.item(), flu_loss[bi].item(), c_loss_1[bi].item(), c_loss_2[bi].item(), last_lr, text_post[bi]))
+        # if args.verbose and ((iter + 1) % args.print_every == 0 or iter == 0 or iter + 1 == args.num_iters):
+        #     text, _, last_text_ids = decode_with_model_topk(
+        #         model, y_logits_, args.topk, soft_forward_x, x_model_past, tokenizer, extra_mask=None, bad_mask=None)
+        #     text_post = text
+        #     for bi in range(args.batch_size):
+        #         prompt = x + " " + text_post[bi]
+        #         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+        #         logger.info("\n Output of the model:\n")
+        #         output_ids  = model.generate(inputs=input_ids, temperature=0.7, max_length = 512, do_sample=True, top_k=args.topk)
+        #
+        #         logger.info(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+        #         logger.info(
+        #             "%d, loss: %.4f,flu_loss: %.4f, c_loss_1: %.4f, c_loss_2: %.4f, lr: %.4f, |%s|" % (
+        #                 iter + 1, loss.item(), flu_loss[bi].item(), c_loss_1[bi].item(), c_loss_2[bi].item(), last_lr, text_post[bi]))
                         
         # 添加噪声以增加多样性
         if iter < args.num_iters - 1:
