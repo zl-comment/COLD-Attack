@@ -347,8 +347,8 @@ def not_matched(o):
     return True  # 没匹配到了，表示成功
 
 def merge_csv(args):
-    folder_path = f"outputs/{args.pretrained_model}"
-    if osp.exists(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv"):
+    folder_path = f"outputs/{args.data_path}/{args.pretrained_model}"
+    if osp.exists(f"outputs/{args.data_path}/{args.pretrained_model}/{args.start}_{args.end}.csv"):
         # result = pd.read_csv(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv")
         file_names = [f"{args.start}_{args.end}.csv"]
         sorted_file_names = file_names
@@ -391,7 +391,7 @@ def run(args):
     total_success_responses_D = 0  # deepseek方法成功的回答数
 
     if args.proxy_model:
-        csv_file = os.path.join("outputs", args.pretrained_model, args.proxy_model,
+        csv_file = os.path.join("outputs",args.data_path, args.pretrained_model, args.proxy_model,
                                 f"{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv")
     else:
         csv_file = os.path.join("outputs", args.pretrained_model,
@@ -509,9 +509,9 @@ def run(args):
 
     # 根据是否存在 proxy_model 决定输出目录
     if args.proxy_model:
-        output_dir = os.path.join("outputs", args.pretrained_model, args.proxy_model)
+        output_dir = os.path.join("outputs",args.data_path, args.pretrained_model, args.proxy_model)
     else:
-        output_dir = os.path.join("outputs", args.pretrained_model)
+        output_dir = os.path.join("outputs",args.data_path, args.pretrained_model)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -564,9 +564,9 @@ def run(args):
 
     # 根据是否存在 proxy_model 决定输出目录的层级
     if args.proxy_model:
-        output_dir = os.path.join("outputs", args.pretrained_model, args.proxy_model)
+        output_dir = os.path.join("outputs",args.data_path, args.pretrained_model, args.proxy_model)
     else:
-        output_dir = os.path.join("outputs", args.pretrained_model)
+        output_dir = os.path.join("outputs",args.data_path, args.pretrained_model)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -597,6 +597,8 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default='proxy',
                         choices=['suffix', 'control', 'paraphrase', 'proxy','proxy_one'])
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--data_path", type=str, default="harmful_behaviors_custom")
+
 
     args = parser.parse_args()
     run(args)

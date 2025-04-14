@@ -95,8 +95,8 @@ def clean_answer(o):
     return o.replace("<s>", "").replace("</s>", "").strip()
     
 def merge_csv(args):
-    folder_path = f"outputs/{args.pretrained_model}"
-    if osp.exists(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv"):
+    folder_path = f"outputs/{args.data_path}/{args.pretrained_model}"
+    if osp.exists(f"outputs/{args.data_path}/{args.pretrained_model}/{args.start}_{args.end}.csv"):
         # result = pd.read_csv(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv")
         file_names = [f"{args.start}_{args.end}.csv"]
         sorted_file_names = file_names
@@ -144,9 +144,9 @@ def run(args):
     # results.to_csv(f"outputs/{args.pretrained_model}/{args.start}_{args.end}_chosen.csv")
 
     if args.proxy_model:
-        results = pd.read_csv(f"outputs/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv")
+        results = pd.read_csv(f"outputs/{args.data_path}/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv")
     else:
-        results = pd.read_csv(f"outputs/{args.pretrained_model}/{args.start}_{args.end}.csv")
+        results = pd.read_csv(f"outputs/{args.data_path}/{args.pretrained_model}/{args.start}_{args.end}.csv")
 
     if args.defense_method == "none":
         ppls_adv = []
@@ -216,5 +216,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default='proxy',
                         choices=['suffix', 'control', 'paraphrase', 'proxy', 'proxy_one'])
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--data_path", type=str, default="harmful_behaviors_custom")
+
     args = parser.parse_args()
     run(args)
