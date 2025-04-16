@@ -128,10 +128,12 @@ def run(args):
     gpt_model, gpt_tokenizer = load_model_and_tokenizer(model_name, low_cpu_mem_usage=True, use_cache=False,
                                                         device="cuda")
 
-    
-    data = pd.read_csv("./data/advbench/harmful_behaviors_custom.csv")
-
-    goals = data['goal'].tolist()[args.start:args.end+1]
+    if args.data_path == 'harmful_behaviors_custom':
+        data = pd.read_csv(f"./data/advbench/{args.data_path}.csv")
+        goals = data['goal'].tolist()[args.start:args.end + 1]
+    else:
+        data = pd.read_csv(f"./data/CNsafe_RT_English/{args.data_path}.csv")
+        goals = data['goal'].tolist()[args.start:args.end]
     
     # results = merge_csv(args)
     # results = results.groupby('prompt')
