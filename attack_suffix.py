@@ -85,6 +85,6 @@ def attack_generation(model, tokenizer, device, args, model_back=None, ppl_last=
 
 
         if osp.exists(f"outputs/{file_name}/{args.pretrained_model}/{args.start}_{args.end}.csv"):
-            results.to_csv(f"outputs/{file_name}/{args.pretrained_model}/{args.start}_{args.end}.csv", mode='a', header=False)
+            results.to_csv(f"outputs/{file_name}/{args.pretrained_model}/{args.start}_{args.end}.csv", mode='w', header=False)
         else:
             results.to_csv(f"outputs/{file_name}/{args.pretrained_model}/{args.start}_{args.end}.csv", mode='w')
