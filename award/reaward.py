@@ -6,57 +6,338 @@ import time
 from award.utils import ReturnStruct
 from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
 from transformers import logging
-# -----------------------------------------
-# 1. 定义辅助函数（分词、编辑距离、SWES、奖励计算、动态温度）
-# -----------------------------------------
-def get_reject_token_ids(target_tokenizer, reject_words):
-    """将拒绝词列表转换为目标模型的 token IDs"""
-    reject_token_ids = set()
-    for word in reject_words:
-        tokens = target_tokenizer.encode(word, add_special_tokens=False)
-        if len(tokens) > 0:
-            # 添加所有 token（处理多 token 词汇）
-            reject_token_ids.update(tokens)
-    return list(reject_token_ids)
 
-#
-# def compute_rejection_prob_loss(
-#         y_logits,
-#         proxy_tokenizer,
-#         target_model,
-#         target_tokenizer,
-#         target_device,
-#         reject_token_ids  # 预计算的拒绝 token IDs 列表
-# ):
-#     """ 计算目标模型对生成文本的拒绝概率 """
-#     # 解码生成文本
+import torch
+import torch.nn.functional as F
+
+from evaluate import query_guard
+
+
+def compute_rejection_prob_weighted(y_logits, reject_token_ids, k=100, device='cuda'):
+    """
+    更准确地衡量生成中出现拒绝 token 的总概率，而不是简单是否命中。
+    """
+    probs = F.softmax(y_logits, dim=-1)  # [B, L, V]
+    topk_values, topk_indices = probs.topk(k=k, dim=-1)  # [B, L, K]
+
+    reject_token_ids = torch.tensor(reject_token_ids, device=device)
+    reject_mask = torch.isin(topk_indices, reject_token_ids)  # [B, L, K]
+
+    # 获取与拒绝词对应的概率值
+    reject_probs = topk_values * reject_mask.float()  # [B, L, K]
+    reject_prob_sum = reject_probs.sum(dim=-1)  # [B, L]
+    reject_prob_avg = reject_prob_sum.mean(dim=-1)  # [B]
+    return reject_prob_avg
+
+#tok-k版本
+def compute_rejection_prob(y_logits, reject_token_ids, k=5, device='cuda'):
+    """
+    计算每个样本的拒绝概率（基于 top-k）
+
+    参数:
+    y_logits: [batch_size, seq_len, vocab_size]，扰动后的 logits
+    reject_token_ids: [list of int]，拒绝词的 token id 列表
+    k: int，top-k 值，取前 k 个 token 来计算拒绝概率
+    device: str，计算设备（'cuda' 或 'cpu'）
+
+    返回：
+    max_reject_probs: [batch_size]，每个样本的最大拒绝概率
+    """
+    # 对 logits 进行 softmax，获得每个位置的 token 概率
+    probs = F.softmax(y_logits, dim=-1)  # [batch_size, seq_len, vocab_size]
+
+    # 对每个 token 位置，取 top-k 的 token id
+    topk_values, topk_indices = probs.topk(k=k, dim=-1)  # [batch_size, seq_len, k]
+
+    # 检查 top-k 中是否包含拒绝 token id
+    reject_mask = torch.isin(topk_indices, torch.tensor(reject_token_ids).to(device))  # [batch_size, seq_len, k]
+
+    # 判断每个位置是否包含拒绝词，若包含则标记为 1
+    reject_flags = reject_mask.any(dim=-1).float()  # [batch_size, seq_len]
+
+    # 对所有 token 位置的拒绝概率取平均，得到每个样本的最大拒绝概率
+    max_reject_probs = reject_flags.mean(dim=-1)  # [batch_size]
+
+    return max_reject_probs
+
+
+# def compute_rejection_prob_vector(y_logits, proxy_tokenizer, target_model, target_tokenizer, device, reject_token_ids):
+#     """
+#     y_logits: [batch, seq_len, vocab_size]，扰动后的 logits
+#     返回每个样本的拒绝概率（例如，取每个样本中所有 token 对拒绝词累加的概率的最大值）
+#     """
 #     texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True)
 #              for ids in torch.argmax(y_logits, dim=-1)]
-#
-#     # 目标模型推理
 #     inputs = target_tokenizer(
 #         texts,
 #         return_tensors="pt",
 #         padding=True,
 #         truncation=True
-#     ).to(target_device)
-#
+#     ).to(device)
 #     with torch.no_grad():
 #         outputs = target_model(**inputs)
-#         logits = outputs.logits  # [batch, seq_len, vocab]
-#
-#         # 计算所有拒绝 token 的概率
-#         reject_probs = torch.zeros(logits.shape[0], device=target_device)
-#         for idx in range(logits.shape[1]):  # 遍历每个 token 位置
+#         logits = outputs.logits  # [batch, seq_len, vocab_size]
+#         token_reject_probs = []
+#         for idx in range(logits.shape[1]):
 #             token_probs = F.softmax(logits[:, idx, :], dim=-1)
-#             reject_probs += token_probs[:, reject_token_ids].sum(dim=-1)  # 累加所有拒绝词概率
-#
-#
-#         # 平均每个 token 的拒绝概率
-#         reject_probs /= logits.shape[1]
-#
-#     return reject_probs.mean()
-#
+#             token_reject = token_probs[:, reject_token_ids].sum(dim=-1)  # [batch]
+#             token_reject_probs.append(token_reject.unsqueeze(1))
+#         token_reject_probs = torch.cat(token_reject_probs, dim=1)  # [batch, seq_len]
+#         max_reject_probs, _ = token_reject_probs.max(dim=1)
+#     return max_reject_probs
+
+
+#中间区间的犹豫loss
+def hesitation_loss(p, tau_acc_low=0.1, tau_acc_high=0.2, mode='hinge', a=50):
+    """
+    p: Tensor of shape [batch]，每个样本当前的拒绝概率
+    tau_acc_low: 当 p 小于等于此值时，视为完全接受；如设定为 0.1
+    tau_acc_high: 当 p 大于此值时，损失达到最大；如设定为 0.2
+    mode: 'hinge' 或 'sigmoid'
+    a: sigmoid 模式下的陡峭参数
+    返回一个标量 loss，用于鼓励 p 较小，从而使输出更偏向接受
+    """
+    if mode == 'hinge':
+        # 当 p 在 [tau_acc_low, tau_acc_high] 区间内，loss 按 (p - tau_acc_low)^2 计算；低于 tau_acc_low loss 为 0，高于 tau_acc_high则取最大值
+        loss = torch.where(
+            p <= tau_acc_low,
+            torch.zeros_like(p),
+            torch.where(
+                p <= tau_acc_high,
+                (p - tau_acc_low) ** 2,
+                (tau_acc_high - tau_acc_low) ** 2 * torch.ones_like(p)
+            )
+        )
+    elif mode == 'sigmoid':
+        # 使用 sigmoid 实现平滑上升，注意此处设计使得当 p 接近 tau_acc_low 时，loss 较小
+        loss = torch.sigmoid(a * (p - tau_acc_low)) - torch.sigmoid(a * (tau_acc_high - tau_acc_low))
+    else:
+        raise ValueError("Unknown mode for hesitation_loss")
+    return loss.mean()
+
+#ent计算前10个token的率
+def compute_entropy_loss_front(logits, top_n=10):
+    probs = F.softmax(logits, dim=-1)
+    log_probs = F.log_softmax(logits, dim=-1)
+    entropy = -(probs[:, :top_n, :] * log_probs[:, :top_n, :]).sum(dim=-1)  # [B, N]
+    return -entropy.mean()
+
+#ent计算平均的token率
+def compute_entropy_loss(logits):
+    """
+    logits: [batch, seq_len, vocab_size]
+    返回：熵损失（鼓励分布多样性，防止总是拒绝）
+    """
+    probs = F.softmax(logits, dim=-1)  # [B, T, V]
+    log_probs = torch.log(probs + 1e-10)
+    ent = - (probs * log_probs).sum(dim=-1)  # [B, T]
+    return -ent.mean()  # 注意是负熵 → 越分散越小，越集中越大
+
+
+def hesitation_loss_continuous(p, target=0.1, scale=300.0):
+    """
+    连续型犹豫 loss，鼓励 p 趋近于目标值（如 0.1），梯度全程连续。
+
+    :param p: Tensor, shape [batch]，拒绝概率（0~1）
+    :param target: float，期望拒绝概率（越小越倾向接受）
+    :param scale: float，惩罚强度因子
+    :return: float, 平均 loss
+    """
+    return scale * ((p - target) ** 2).mean()
+
+
+def hesitation_loss_fivesmooth(p):
+    """
+    完美分段式犹豫 loss，连续、光滑、单调惩罚。
+    输入:
+        p: Tensor of shape [batch]，拒绝概率
+    返回:
+        平均 loss，float
+    """
+    loss = torch.zeros_like(p)
+
+    # 第一段 [0.1, 0.3) —— 平滑抛物线：较弱梯度
+    mask1 = (p >= 0.1) & (p < 0.3)
+    loss[mask1] = 5 * (p[mask1] - 0.1) ** 2
+
+    # 第二段 [0.3, 0.5) —— 梯度增强
+    mask2 = (p >= 0.3) & (p < 0.5)
+    loss[mask2] = 20 * (p[mask2] - 0.3) ** 2 + 0.2  # 衔接前段
+
+    # 第三段 [0.5, 0.7) —— 更强惩罚
+    mask3 = (p >= 0.5) & (p < 0.7)
+    loss[mask3] = 50 * (p[mask3] - 0.5) ** 2 + 0.6
+
+    # 第四段 [0.7, 0.9) —— 非常强的梯度推拒绝回退
+    mask4 = (p >= 0.7) & (p < 0.9)
+    loss[mask4] = 150 * (p[mask4] - 0.7) ** 2 + 1.4
+
+    # 第五段 [0.9, 1.0] —— 极强惩罚
+    mask5 = (p >= 0.9)
+    loss[mask5] = 400 * (p[mask5] - 0.9) ** 2 + 3.0
+
+    return loss.mean()
+
+
+# -----------------------------------------
+# 1. 定义辅助函数（分词、编辑距离、SWES、奖励计算、动态温度）
+# -----------------------------------------
+# def get_reject_token_ids(target_tokenizer, reject_words):
+#     """将拒绝词列表转换为目标模型的 token IDs"""
+#     reject_token_ids = set()
+#     for word in reject_words:
+#         tokens = target_tokenizer.encode(word, add_special_tokens=False)
+#         if len(tokens) > 0:
+#             # 添加所有 token（处理多 token 词汇）
+#             reject_token_ids.update(tokens)
+#     return list(reject_token_ids)
+def get_reject_token_ids(tokenizer, bad_words_list):
+    """
+    将每个拒绝关键词或短语单独编码，汇总所有 token ids。
+
+    :param tokenizer: 使用的 tokenizer（建议为 target_tokenizer）
+    :param bad_words_list: list[str]，拒绝相关的单词或短语
+    :return: list[int]，拒绝词汇对应的 token ids（去重后）
+    """
+    reject_token_ids = set()
+
+    for phrase in bad_words_list:
+        phrase = phrase.strip()
+        if not phrase:
+            continue
+        # 编码短语为多个 token id（不加特殊符号）
+        token_ids = tokenizer.encode(phrase, add_special_tokens=False)
+        reject_token_ids.update(token_ids)
+
+    return sorted(reject_token_ids)
+
+def compute_combined_rejection_loss(
+        y_logits,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        target_device,
+        reject_token_ids  # 预计算的拒绝 token IDs 列表
+):
+    """
+    结合平均拒绝概率和前 top-k 拒绝概率的损失，鼓励模型减少拒绝词汇的生成。
+    :param y_logits: [batch_size, seq_len, vocab_size]
+    :param reject_token_ids: [list of int]，拒绝词 token ids
+    :param top_k: int，top-k 值
+    :param device: 计算设备
+    :return: combined_reject_loss
+    """
+    # 计算平均拒绝概率
+    avg_reject_prob = compute_rejection_prob_loss_avg(
+        y_logits,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        target_device,
+        reject_token_ids  # 预计算的拒绝 token IDs 列表
+)
+
+    # 计算前 top-k 拒绝概率
+    top_reject_prob = compute_rejection_prob_loss_topk(
+        y_logits,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        target_device,
+        reject_token_ids,  # 预计算的拒绝 token IDs 列表
+        top_k = 10  # 控制top-k值
+)
+
+
+    # 结合两个损失（你可以加权它们）
+    combined_reject_loss = 0.4*avg_reject_prob + 0.6*top_reject_prob  # 你可以设置权重，例如: `0.5 * avg_reject_prob + 0.5 * topk_reject_prob`
+
+    return combined_reject_loss
+
+#取平均拒绝
+def compute_rejection_prob_loss_avg(
+        y_logits,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        target_device,
+        reject_token_ids  # 预计算的拒绝 token IDs 列表
+):
+    """ 计算目标模型对生成文本的拒绝概率（修改为关注局部最高概率）
+    通过对每个样本中所有 token 的拒绝词概率取最大值来反映局部高概率问题
+    """
+    from transformers import logging
+    logging.set_verbosity_error()
+
+    # 解码生成文本
+    texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True)
+             for ids in torch.argmax(y_logits, dim=-1)]
+
+    # 目标模型推理
+    inputs = target_tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).to(target_device)
+
+    with torch.no_grad():
+        outputs = target_model(**inputs)
+        logits = outputs.logits  # [batch, seq_len, vocab]
+
+        probs = F.softmax(logits, dim=-1)  # [B, T, V]
+        # 拒绝词概率总和
+        reject_probs = probs[:, :, reject_token_ids].sum(dim=-1)  # [B, T]
+        # 全序列取平均
+        avg_reject_prob = reject_probs.mean(dim=-1)  # [B]
+
+        # query_guard()
+
+    return avg_reject_prob.mean()
+# top-k token 中拒绝词概率的平均值
+def compute_rejection_prob_loss_topk(
+        y_logits,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        target_device,
+        reject_token_ids,
+        top_k=10  # 控制top-k值
+):
+    """
+    计算目标模型对生成文本的拒绝概率（取每个样本前 top-k 拒绝 token 的平均概率）
+    """
+    from transformers import logging
+    logging.set_verbosity_error()
+
+    # 解码生成文本
+    texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True)
+             for ids in torch.argmax(y_logits, dim=-1)]
+
+    # 编码生成文本
+    inputs = target_tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).to(target_device)
+
+    with torch.no_grad():
+        outputs = target_model(**inputs)
+        logits = outputs.logits  # [batch, seq_len, vocab]
+
+        # 计算每个 token 的 softmax 概率
+        probs = F.softmax(logits, dim=-1)  # [B, T, V]
+        reject_probs = probs[:, :, reject_token_ids].sum(dim=-1)  # [B, T]
+
+        # 取前 top-k 个拒绝概率最高的位置并取平均
+        k = min(top_k, reject_probs.shape[1])  # 防止句子长度小于 k
+        topk_vals = reject_probs.topk(k=k, dim=1).values  # [B, k]
+        topk_avg = topk_vals.mean(dim=1)  # [B]
+
+    return topk_avg.mean()
+
+#取最大拒绝
 def compute_rejection_prob_loss(
         y_logits,
         proxy_tokenizer,
@@ -98,6 +379,8 @@ def compute_rejection_prob_loss(
         token_reject_probs = torch.cat(token_reject_probs, dim=1)
         # 取每个样本中拒绝概率最高的那个 token
         max_reject_probs = token_reject_probs.max(dim=1)[0]  # [batch]
+
+        # query_guard()
 
     return max_reject_probs.mean()
 
