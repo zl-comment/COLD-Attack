@@ -57,6 +57,7 @@ def load_base_model(
 def load_proxy_model(
     model_path: str,
     device: str = 'cuda',
+    args=None,
     **kwargs
 ) -> tuple:
     """
@@ -65,10 +66,14 @@ def load_proxy_model(
     Args:
         model_path (str): 模型路径或名称
         device (str): 运行设备
+        args=None,  # 这里你可以使用 args
         **kwargs: 其他参数
     
     Returns:
         tuple: (model, tokenizer, suffix_manager)
+        @param model_path:  模型本地地址或者huggingface地址
+        @param device: cuda or cpu
+        @type args: 其他参数
     """
     try:
         # 检查GPU可用性
@@ -89,30 +94,21 @@ def load_proxy_model(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        if 'gpt-j-6b' in model_path:
 
-            model = GPTJForCausalLM.from_pretrained(model_path,low_cpu_mem_usage = True,
-            use_cache = False, torch_dtype=torch.float16).to(device)
-        if 'final_model' in model_path:
-            # 加载模型配置
-            generation_config = GenerationConfig.from_pretrained(
-                model_path,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                max_length=512,
-                pad_token_id=tokenizer.pad_token_id
-            )
-            print("Generation config loaded.")
+        if 'fine' in args.proxy_model:
 
-            # 加载完整模型（使用complete_model文件夹）
-            model_path = Path(model_path) / "complete_model"
-            model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                generation_config=generation_config
-            )
+            peft_model_id ="/home/zl/ZLCODE/remiss-jailbreak/res/targetllama2_chat_lambda150_logprobs2_optremiss_1744724591/checkpoints/step_312"
+            model = AutoModelForCausalLM.from_pretrained(model_path,
+            torch_dtype=torch.float16,
+            device_map='auto' if device=='cuda' else None,
+            low_cpu_mem_usage = True,
+            use_cache = False)
+            model.load_adapter(peft_model_id)
+            # 设置模型为评估模式
+            model.eval()
+
+            # 加载分词器
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
             print("Model loaded successfully.")
 
         else:
@@ -161,7 +157,7 @@ def load_proxy_model(
 
         print("Tokenizer vocab size:", tokenizer.vocab_size)
         print("Embedding matrix size:", model.get_input_embeddings().weight.size(0))
-        print("成功加载proxy_model")
+        print("[成功加载proxy_model]")
         return model, tokenizer
         
     except Exception as e:
