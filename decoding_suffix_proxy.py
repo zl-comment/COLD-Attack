@@ -24,8 +24,12 @@ from nltk.tokenize import word_tokenize
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from award.reaward import compute_adv_loss_from_safe_baseline_min_gap, build_safe_prompt, compute_cw_loss, \
-    compute_semantic_reject_loss, compute_rejection_prob_loss, get_reject_token_ids, compute_adv_loss_optimized_v1
-from model.Apimodel import  call_api_completion
+    compute_semantic_reject_loss, compute_rejection_prob_loss, get_reject_token_ids, compute_adv_loss_optimized_v1, \
+    hesitation_loss, hesitation_loss_fivesmooth, compute_entropy_loss, \
+    compute_rejection_prob, compute_rejection_prob_weighted, hesitation_loss_continuous, \
+    compute_rejection_prob_loss_avg, compute_entropy_loss_front, compute_combined_rejection_loss, \
+    batch_bleu_similarity_score, compute_rejection_prob_loss_avg_generate
+# from model.Apimodel import  call_api_completion
 from model.use_distilled_model import load_model
 from opt_util import load_model_and_tokenizer
 from award.utils import ReturnStruct
@@ -171,7 +175,7 @@ def decode(target_model_path, device, x="", z="", constraints=None, args=None, s
 
 
     # 加载代理模型
-    proxy_model, proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device)
+    proxy_model, proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device,args=args)
     text, _, last_text_ids = decode_proxy_little(target_model_path, proxy_model, proxy_tokenizer, device, x, z,
                                                  constraints, args, sys_prompt, prefix, model_back, zz)
 
@@ -378,7 +382,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     constraints: (constraint set in lexical constrained task)
     """
 
-    print("启动")
+    print("[启动]")
     proxy_model.eval()  # 设置评估模式
     logger = setup_logger(args)
     if not args.useapi:
@@ -388,76 +392,33 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
 
 
     # 不良词汇
-    words = ['sorry', 'apologetic', 'regretful',
-             'unethical', 'immoral', 'dishonest',
-             'illegal', 'unlawful', 'illicit',
-             'harmful', 'detrimental', 'injurious',
-             'afraid', 'fearful', 'apprehensive',
-             'cannot', 'unable', 'unable to',
-             'apologize', 'regret',
-             'unable', 'incapable', 'powerless',
-             'not', 'no', 'nay',
-             'responsible', 'accountable', 'liable',
-             'ethic', 'morality', 'moral',
-             'legal', 'lawful', 'legitimate',
-             'ethical', 'moral', 'principled',
-             'fulfill', 'accomplish', 'achieve',
-             'just', 'fair', 'equitable',
-             'trustworthy', 'reliable', 'dependable',
-             'repentant', 'penitent', 'remorseful',
-             'unprincipled', 'unscrupulous', 'corrupt',
-             'unlawful', 'prohibited', 'forbidden',
-             'noxious', 'destructive', 'damaging',
-             'timid', 'terrified', 'panicked',
-             'unable', 'incompetent', 'incapacitated',
-             'prohibited', 'banned', 'forbidden',
-             'deny', 'refuse', 'decline',
-             'answerable', 'culpable', 'answerable',
-             'moral code', 'values', 'principles',
-             'legitimate', 'valid', 'authorized',
-             'virtuous', 'righteous', 'honorable',
-             'satisfy', 'complete', 'execute',
-             'fair-minded', 'impartial', 'equitable',
-             'reliable', 'trustable', 'faithful', 'invalid', 'safe', 'not', "can't", "but", "against",
-             "I'm sorry",
-             "Sorry",
-             "I am sorry",
-             "I apologize",
-             "As an",
-             "As an AI",
-             "I'm an",
-             "I'm just",
-             "As a language model",
-             "As an Assistant",
-             "I cannot",
-             "I do not",
-             "Hello!",
-             "is illegal and unethical",
-             "I'm really sorry",
-             "OpenAI",
-             "unethical",
-             "not ethical",
-             "not legal",
-             "My apologies",
-             "but I cannot",
-             "If you have any other non-malicious requests",
-             "I'm not able to provide",
-             "I am really sorry",
-             "I cannot create",
-             "I cannot support",
-             "I can't provide",
-             "I can't assist",
-             "I cannot fulfill",
-             "not support"
-             ]
-
+    words = [
+        'sorry', 'apologetic', 'regretful', 'unethical', 'immoral', 'dishonest',
+        'illegal', 'unlawful', 'illicit', 'harmful', 'detrimental', 'injurious',
+        'afraid', 'fearful', 'apprehensive', 'cannot', 'unable', 'unable to', 'apologize',
+        'regret', 'criminal', 'Illegally', 'unable', 'incapable', 'powerless', 'not', 'no',
+        'nay', 'responsible', 'accountable', 'liable', 'ethic', 'morality', 'moral', 'legal',
+        'lawful', 'legitimate', 'ethical', 'moral', 'principled', 'fulfill', 'accomplish',
+        'achieve', 'just', 'fair', 'equitable', 'trustworthy', 'reliable', 'dependable',
+        'repentant', 'penitent', 'remorseful', 'unprincipled', 'unscrupulous', 'corrupt',
+        'unlawful', 'prohibited', 'forbidden', 'noxious', 'destructive', 'damaging', 'timid',
+        'terrified', 'panicked', 'unable', 'incompetent', 'incapacitated', 'prohibited', 'banned',
+        'forbidden', 'deny', 'refuse', 'decline', 'answerable', 'culpable', 'answerable', 'moral code',
+        'values', 'principles', 'legitimate', 'valid', 'authorized', 'virtuous', 'righteous',
+        'honorable', 'satisfy', 'complete', 'execute', 'fair-minded', 'impartial', 'equitable',
+        'reliable', 'trustable', 'faithful', 'invalid', 'safe', 'not', "can't", "but", "against",
+        "sorry",  "apologize",  "AI", "I'm", "an",  "just",
+        "language", "model",   "Assistant",  "cannot",
+         "cannot", "create",     "can't", "fulfill", "not","attempt","provide",
+        "I cannot fulfill your request","I'm just an AI","cannot fulfill","Do not write a social media"
+    ]
 
     # 包含大写小写的不良词汇
-    lowercase_words = [word.upper() for word in words]
+    lowercase_words = [word.upper()+word.capitalize()+word.title()+word for word in words]
 
-    bad_words = words + lowercase_words
+    # bad_words = words + lowercase_words
 
-    bad_words = ' '.join(bad_words)
+    bad_words = ' '.join(lowercase_words)
 
     BIG_CONST = 1e10
     if args.use_sysprompt:
@@ -605,6 +566,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     #                map_location=target_model.device)
     # )
     # classifier.eval()
+    reject_token_ids = get_reject_token_ids(target_tokenizer, lowercase_words)
 
     for ite in pbar:
         optim.zero_grad()
@@ -676,15 +638,15 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
 
         sem_loss = compute_semantic_reject_loss(y_logits_, bad_words_t.flatten().unique().tolist(), embedding_layer,threshold=0.7 )
         # ----------------词向量--------------------------
-
+        if torch.isnan(sem_loss):
+            print("Warning: sem_loss is NaN, resetting to zero")
 
 
 
         #-------------------------------------------------
         # 在训练循环中调用
         # 在训练前预计算拒绝 token IDs
-        reject_token_ids = get_reject_token_ids(target_tokenizer, words)
-        reject_loss = compute_rejection_prob_loss(
+        reject_loss = compute_rejection_prob_loss_avg_generate(
             y_logits_,
             proxy_tokenizer,
             target_model,
@@ -692,27 +654,35 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             target_model.device,
             reject_token_ids  # 传入预计算的拒绝 token IDs
         ).to(device)
+        # 在计算 reject_loss 后，计算每个样本的拒绝概率向量
+        # p_reject = compute_rejection_prob_weighted(y_logits, reject_token_ids, k=5, device=device)
 
-
+        ## 计算犹豫 loss，要求输出向接受方向（即 p 越小越好）
+        # hes_loss = hesitation_loss_fivesmooth(reject_loss)
+        hes_loss = hesitation_loss_continuous(reject_loss)
+        #防止模式集中
+        # ent_loss = compute_entropy_loss(y_logits_)
+        # ent_loss = compute_entropy_loss_front(y_logits_)
 
         #--------------------------------------------------
-        c_loss_2 = batch_log_bleulosscnn_ae(decoder_outputs=y_logits_.transpose(0, 1),
-                                             target_idx=bad_words_t,
-                                             ngram_list=[1])
+        # c_loss_2 = batch_log_bleulosscnn_ae(decoder_outputs=y_logits_.transpose(0, 1),
+        #                                      target_idx=bad_words_t,
+        #                                      ngram_list=[1])
 
+        bleu_loss =batch_bleu_similarity_score(decoder_outputs=y_logits_.transpose(0, 1), target_idx=z_t,ngram_list=[1])
         # 精确的KL散度计算
         # z_t 为目标token ids，shape=[batch, seq_len]
         # 统一长度，明确使用最短序列
-        seq_len = min(y_logits_.size(1), k_onehot.size(1))
-
-        log_probs_pred = F.log_softmax(y_logits_[:, :seq_len, :], dim=-1)
-        target_onehot = k_onehot[:, :seq_len, :].float()
-        #避免生成的目标
-        kl_loss = F.kl_div(log_probs_pred, target_onehot, reduction='batchmean')
-
-        if torch.isnan(kl_loss):
-            print("Warning: KL loss is NaN, resetting to zero")
-            kl_loss = torch.zeros_like(kl_loss)
+        # seq_len = min(y_logits_.size(1), k_onehot.size(1))
+        #
+        # log_probs_pred = F.log_softmax(y_logits_[:, :seq_len, :], dim=-1)
+        # target_onehot = k_onehot[:, :seq_len, :].float()
+        # #避免生成的目标
+        # kl_loss = F.kl_div(log_probs_pred, target_onehot, reduction='batchmean')
+        #
+        # if torch.isnan(kl_loss):
+        #     print("Warning: KL loss is NaN, resetting to zero")
+        #     kl_loss = torch.zeros_like(kl_loss)
 
 
 
@@ -752,11 +722,14 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         # cw_weight = args.cw_weight * (1.0 + 0.3 * progress)
         # 动态权重设置
         progress = ite / args.num_iters
-        flu_weight = 50 * (1.0 + 0.2 * progress)  # 适当降低流畅性权重
-        rej_weight = args.rej_weight * (1.0 + 0.3 * progress)  # 增加拒绝相关损失权重
+        # flu_weight = 50 * (1.0 + 0.2 * progress)  # 适当降低流畅性权重
+        flu_weight = 10  # 适当降低流畅性权重
+        rej_weight = args.rej_weight   # 增加拒绝相关损失权重
         # Re_weight = 100 * (1.0 + 0.5 * progress)  # 大幅增加ReturnStruct权重
-        kl_loss_weight = args.kl_max_weight*10 * (1.0 + 0.3 * progress)  # 随着训练进行减小语义拒绝损失权重
-        goal_weight = args.goal_weight * (1.0 + 0.3 * progress)  # 增加目标文本相似度权重
+        kl_loss_weight = args.kl_max_weight   # 随着训练进行减小语义拒绝损失权重
+        goal_weight = args.goal_weight   # 增加目标文本相似度权重
+        hes_weight = 1000  # 加强拒绝概率的惩罚
+        # ent_weight = 200
         # cw_weight = args.cw_weight * (1.0 + 0.5 * progress)  # 增加CW损失权重
         # 假设 warmup_iters 占总迭代数的 30%
         # warmup_iters = args.num_iters * 0.3
@@ -788,40 +761,18 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         # 计算各个分项损失
         loss1 = goal_weight * c_loss_1  # 目标文本相似度损失
         loss2 = flu_weight * flu_loss  # 流畅性损失
-        loss3 = - rej_weight * c_loss_2  # BLEU/约束相关损失（注意这里是负的）
+        # loss3 = - rej_weight * c_loss_2  # BLEU/约束相关损失（注意这里是负的）
+        loss3 = - rej_weight * bleu_loss  # BLEU/约束相关损失（注意这里是负的）
         loss4 = kl_loss_weight * sem_loss  # 语义拒绝/KL损失
-        loss5 = 100 * reject_loss  # 拒绝概率损失
+        # loss5 = 100 * p_reject  # 犹豫loss
+        loss5 = hes_weight * hes_loss
+        # loss6 = - ent_weight * ent_loss
 
         # loss = goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2 + kl_loss_weight * sem_loss.to(device)  + 100 * reject_loss
         # 总损失
-        loss_total = loss1 + loss2 + loss3 + loss4 + loss5
+        loss_total = loss1 + loss2  + loss4 + loss5  - loss3 #+ loss6
 
-        # grad1 = torch.autograd.grad(loss1.mean(), epsilon, retain_graph=True)[0]
-        # grad2 = torch.autograd.grad(loss2.mean(), epsilon, retain_graph=True)[0]
-        # grad3 = torch.autograd.grad(loss3.mean(), epsilon, retain_graph=True)[0]
-        # grad4 = torch.autograd.grad(loss4.mean(), epsilon, retain_graph=True)[0]
-        # grad5 = torch.autograd.grad(loss5.mean(), epsilon, retain_graph=True)[0]
 
-        # 计算总梯度
-        # total_grad = torch.autograd.grad(loss_total, epsilon, retain_graph=True)[0]
-        # 计算各梯度的 L2 范数
-        # norm1 = grad1.norm().item()
-        # norm2 = grad2.norm().item()
-        # norm3 = grad3.norm().item()
-        # norm4 = grad4.norm().item()
-        # norm5 = grad5.norm().item()
-
-        # # 定义余弦相似度计算函数
-        # def cosine_similarity(a, b):
-        #     return (a.flatten() @ b.flatten()) / (a.norm() * b.norm() + 1e-8)
-
-        # cos_sim1 = cosine_similarity(grad1, total_grad).item()
-        # cos_sim2 = cosine_similarity(grad2, total_grad).item()
-        # cos_sim3 = cosine_similarity(grad3, total_grad).item()
-        # cos_sim4 = cosine_similarity(grad4, total_grad).item()
-        # cos_sim5 = cosine_similarity(grad5, total_grad).item()
-        # loss =goal_weight * c_loss_1 + flu_weight * flu_loss - rej_weight * c_loss_2  + Re_weight * ReturnStruct.loss
-        # loss = F.softplus(loss)
         loss = loss_total.mean()
         # l2_reg = torch.norm(epsilon) * 0.01
         # loss += l2_reg
@@ -846,33 +797,32 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             text_post = text
             for bi in range(args.batch_size):
                 prompt = x + " " + text_post[bi]
-                input_ids = proxy_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+                print("[攻击中]:" )
+                print("[提示词输入]: %s" % prompt)
+                # input_ids = proxy_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+                input_ids = target_tokenizer(prompt, return_tensors="pt").input_ids.to(target_model.device)
                 logger.info("\n Output of the model:\n")
-                output_ids = proxy_model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
+                output_ids = target_model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
                                             top_k=args.topk)
-                print("output_ids:",proxy_tokenizer.decode(output_ids[0], skip_special_tokens=True))
+                # logger.info("[output]: %s" % (proxy_tokenizer.decode(output_ids[0], skip_special_tokens=True)))
+                print("[目标模型输出]: %s" % (target_tokenizer.decode(output_ids[0], skip_special_tokens=True)) )
 
 
 
         if args.wandb:
             wandb_step = ite + 1
             wandb.log({
-                # "grad_norm/goal_weight * c_loss_1": norm1,
-                # "grad_norm/flu_weight * flu_loss": norm2,
-                # "grad_norm/-rej_weight * c_loss_2": norm3,
-                # "grad_norm/kl_loss_weight * sem_loss": norm4,
-                # "grad_norm/100 * reject_loss": norm5,
-                # "grad_cos/goal_weight * c_loss_1": cos_sim1,
-                # "grad_cos/flu_weight * flu_loss": cos_sim2,
-                # "grad_cos/-rej_weight * c_loss_2": cos_sim3,
-                # "grad_cos/kl_loss_weight * sem_loss": cos_sim4,
-                # "grad_cos/100 * reject_loss": cos_sim5,
+                'p_reject/mean': reject_loss.mean().item(),
+                # 'p_reject/max': reject_loss.max().item(),
+                # 'p_reject/min': reject_loss.min().item(),
                 'loss/total': loss.item(),
                 'loss/fluency': flu_weight * flu_loss.mean().item(),
                 'loss/target': goal_weight *  c_loss_1.mean().item(),
+                # 'loss/ent': ent_weight * ent_loss.mean().item(),
                 # 'loss/cw': cw_loss.mean().item(),
-                'loss/bleu': rej_weight * c_loss_2.mean().item(),
-                'loss/reject': 100 * reject_loss.mean().item(),
+                'loss/bleu': rej_weight * bleu_loss.mean().item(),
+                # 'loss/reject': 100 * reject_loss.mean().item(),
+                'loss/hes': hes_weight * hes_loss.mean().item(),
                 # 'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
                 'loss/kl_sm': kl_loss_weight * sem_loss.mean().item(),
                 # 'loss/ Critic': Re_weight * ret_struct .loss.mean().item(),
