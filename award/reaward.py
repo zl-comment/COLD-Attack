@@ -9,8 +9,68 @@ from transformers import logging
 
 import torch
 import torch.nn.functional as F
+from torch import amp
 
 from evaluate import query_guard
+
+
+def batch_bleu_similarity_score(decoder_outputs, target_idx, ngram_list, pad=0, weight_list=None):
+    """
+    decoder_outputs: [output_len, batch_size, vocab_size] -> 模型输出的 logits（未转置）
+    target_idx: [batch_size, target_len] -> 你想评估相似度的目标句子的 token ids
+    ngram_list: int or List[int]
+    pad: pad token ID
+    weight_list: 每个 n-gram 的权重（默认平均）
+
+    return: 相似度得分（Tensor [batch_size]），越高越好
+    """
+
+    decoder_outputs = decoder_outputs.transpose(0, 1)  # [batch, output_len, vocab]
+    batch_size, output_len, vocab_size = decoder_outputs.size()
+    _, tgt_len = target_idx.size()
+
+    if isinstance(ngram_list, int):
+        ngram_list = [ngram_list]
+    if ngram_list[0] <= 0:
+        ngram_list[0] = output_len
+    if weight_list is None:
+        weight_list = [1. / len(ngram_list)] * len(ngram_list)
+
+    # Step 1: Log softmax over vocab
+    decoder_outputs = torch.log_softmax(decoder_outputs, dim=-1)
+    decoder_outputs = torch.relu(decoder_outputs + 20) - 20  # clip very small values
+
+    # Step 2: 获取每个位置对应的 target 的概率
+    index = target_idx.unsqueeze(1).expand(-1, output_len, tgt_len)
+    cost_nll = decoder_outputs.gather(dim=2, index=index)  # [batch, output_len, tgt_len]
+    cost_nll = cost_nll.unsqueeze(1)  # [batch, 1, output_len, tgt_len]
+    out = cost_nll
+
+    # Step 3: PAD mask
+    zero = torch.tensor(0.0, device=decoder_outputs.device)
+    target_expand = target_idx.view(batch_size, 1, 1, -1).expand(-1, -1, output_len, -1)
+    out = torch.where(target_expand == pad, zero, out)
+
+    # Step 4: n-gram conv2d + weighted sum
+    sum_gram = 0.
+    for cnt, ngram in enumerate(ngram_list):
+        if ngram > output_len:
+            continue
+        eye_filter = torch.eye(ngram, device=decoder_outputs.device).view(1, 1, ngram, ngram)
+        with amp.autocast("cuda"):
+            term = F.conv2d(out, eye_filter) / ngram
+
+        if ngram < decoder_outputs.size()[1]:
+            term = term.squeeze(1)
+            gum_tmp = F.gumbel_softmax(term, tau=1, dim=1)
+            term = term.mul(gum_tmp).sum(1).mean(1)  # [batch]
+        else:
+            while len(term.shape) > 1:
+                assert term.shape[-1] == 1, str(term.shape)
+                term = term.sum(-1)
+        sum_gram += weight_list[cnt] * term
+
+    return sum_gram  # 越大越相似（不加负号）
 
 
 def compute_rejection_prob_weighted(y_logits, reject_token_ids, k=100, device='cuda'):
@@ -254,6 +314,112 @@ def compute_combined_rejection_loss(
 
     return combined_reject_loss
 
+from transformers import logging
+def safe_generate_with_clamp(model, input_ids, attention_mask, max_new_tokens=15):
+    from transformers.generation.utils import GenerationMixin
+
+    # monkey patch sampling step
+    original_sample = GenerationMixin._sample
+
+    def safe_sample(self, *args, **kwargs):
+        output = original_sample(self, *args, **kwargs)
+        if torch.isnan(output).any() or (output < 0).any():
+            print("❌ Detected invalid output in sampling!")
+        return output
+
+    GenerationMixin._sample = safe_sample
+
+    try:
+        return model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            top_p=0.95,
+            temperature=0.7,  # 提高 temperature 防止 degenerate softmax
+            top_k=50
+        )
+    finally:
+        # 恢复原函数
+        GenerationMixin._sample = original_sample
+
+def compute_rejection_prob_loss_avg_generate(
+        y_logits,
+        proxy_tokenizer,
+        target_model,
+        target_tokenizer,
+        target_device,
+        reject_token_ids,
+        max_new_tokens=15
+):
+    logging.set_verbosity_error()
+
+    # Step 1: 解码代理模型输出作为提示文本
+    texts = [proxy_tokenizer.decode(ids, skip_special_tokens=True)
+             for ids in torch.argmax(y_logits, dim=-1)]
+
+    # DEBUG：检查是否为空提示
+    for t in texts:
+        if len(t.strip()) == 0:
+            print("⚠️ Warning: empty prompt found!")
+
+    # Step 2: 编码 prompt 文本
+    inputs = target_tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).to(target_device)
+
+    with torch.no_grad():
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        if input_ids.shape[1] == 0:
+            raise ValueError("input_ids is empty!")
+
+        input_lengths = attention_mask.sum(dim=1)  # 每个样本 prompt 长度
+
+        # Step 3: 使用目标模型生成完整文本
+        generated_ids = safe_generate_with_clamp(target_model, input_ids, attention_mask)
+  # [B, prompt_len + max_new_tokens]
+
+        # Step 4: 去掉 prompt，仅保留新增 token
+        generated_only_ids = [
+            ids[input_len:input_len + max_new_tokens]
+            for ids, input_len in zip(generated_ids, input_lengths)
+        ]
+
+        # Step 5: 解码为仅后缀文本
+        generated_texts = target_tokenizer.batch_decode(
+            generated_only_ids, skip_special_tokens=True
+        )
+
+        # Step 6: 再次编码生成文本
+        inputs2 = target_tokenizer(
+            generated_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        ).to(target_device)
+
+        outputs = target_model(**inputs2)
+        logits = outputs.logits  # [B, T, V]
+
+        # 防止 logits 异常
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        probs = F.softmax(logits, dim=-1)
+
+        # Step 7: 计算拒绝词的概率
+        vocab_size = probs.size(-1)
+        valid_ids = [i for i in reject_token_ids if i < vocab_size]
+        if len(valid_ids) == 0:
+            return torch.tensor(0.0, device=target_device)
+
+        reject_probs = probs[:, :, valid_ids].sum(dim=-1)  # [B, T]
+        avg_reject_prob = reject_probs.mean(dim=-1)        # [B]
+
+    return avg_reject_prob.mean()  # 单个平均拒绝分数
+
 #取平均拒绝
 def compute_rejection_prob_loss_avg(
         y_logits,
@@ -278,7 +444,7 @@ def compute_rejection_prob_loss_avg(
         texts,
         return_tensors="pt",
         padding=True,
-        truncation=True
+        truncation=True,
     ).to(target_device)
 
     with torch.no_grad():
