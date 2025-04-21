@@ -12,7 +12,7 @@ pairs = []
 # For each index from 0 to 49
 for j in range(50):
     # Construct the filename
-    filename = rf"D:\ZLCODE\COLD-Attack\comparison\GCG\guanaco-7B-HF\gcg\len20_2000step_bs8_seed20_l50_ce-all-t1.0_static_space_k256_orig\AdvBenchAll_{j:02d}.jsonl"
+    filename = rf"D:\ZLCODE\COLD-Attack\comparison\GCG\Mistral-7B-Instruct-v0.2\gcg\len20_2000step_bs8_seed20_l50_ce-all-t1.0_static_space_k256_orig\AdvBenchAll_{j:02d}.jsonl"
 
     # Read the JSONL file - 每行一个JSON对象
     with open(filename, 'r', encoding='utf-8') as f:
@@ -42,4 +42,4 @@ for j in range(50):
 # Create DataFrame and save to CSV
 df_pairs = pd.DataFrame(pairs)
 os.makedirs('../../comparison/GCG/', exist_ok=True)
-df_pairs.to_csv('../../comparison/GCG/guanaco_0_50.csv', index=False)
+df_pairs.to_csv('../../comparison/GCG/Mistral_0_50.csv', index=False)
