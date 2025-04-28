@@ -9,30 +9,48 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # 读取 CSV 数据并获取 prompt 列表
-data = pd.read_csv("./outputs/Llama-2-7b-chat-hf/output_hf-v1/0_50_proxy_8_2000_100.0_100.0_500.0_100.0.csv")
+data = pd.read_csv(
+    "D:\\ZLCODE\\COLD-Attack\\outputs\\harmful_behaviors_custom\\Llama-2-7b-chat-hf\\0_50.csv")
 prompt_with_adv = data['prompt_with_adv'].tolist()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 加载模型和分词器
-model, tokenizer = load_model_and_tokenizer("D:\\ZLCODE\\model\\Llama-2-7b-chat-hf",
-                                            low_cpu_mem_usage=True,
-                                            use_cache=False,
-                                            device=device)
+# # # 加载模型和分词器
+# model, tokenizer = load_model_and_tokenizer("D:\\ZLCODE\\model\\Llama-2-7b-chat-hf",
+#                                             low_cpu_mem_usage=True,
+#                                             use_cache=False,
+#                                             device=device)
 
-print(model)          # 观察整体结构
-print(model.model)    # 查看主模型模块
-print(model.model.layers)  # 确认层列表是否存在
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
+model_id = "D:\\ZLCODE\\LoRAPrune\\output_hf-v1"
+peft_model_id = "D:\\ZLCODE\\remiss-jailbreak\\res\\targetllama2_chat_lambda150_logprobs2_optremiss_1744724591\\checkpoints\\step_312"
+
+model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
+model.load_adapter(peft_model_id)
 # 设置模型为评估模式
 model.eval()
 
-# 定义前向钩子函数，用于禁用目标神经元（假定目标神经元在第一层，索引为 2533）
-target_neuron_index = 2533
-def disable_neuron_hook(module, input, output):
-    # 假设输出形状为 [batch_size, seq_length, hidden_size]
-    if isinstance(output, torch.Tensor):
-        output[..., target_neuron_index] = 0
-    return output
+# 加载分词器
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+# Ensure the tokenizer has a padding token
+tokenizer.pad_token = tokenizer.eos_token  # Or set a custom token like '[PAD]'
+tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+tokenizer.pad_token = '[PAD]'
+
+#
+# print(model)          # 观察整体结构
+# print(model.model)    # 查看主模型模块
+# print(model.model.layers)  # 确认层列表是否存在
+
+
+
+# # 定义前向钩子函数，用于禁用目标神经元（假定目标神经元在第一层，索引为 2533）
+# target_neuron_index = 2533
+# def disable_neuron_hook(module, input, output):
+#     # 假设输出形状为 [batch_size, seq_length, hidden_size]
+#     if isinstance(output, torch.Tensor):
+#         output[..., target_neuron_index] = 0
+#     return output
 
 decoded_texts = []  # 用于存储每个 prompt 的正常和干预后的生成结果
 
@@ -97,31 +115,31 @@ for bi in range(len(prompt_with_adv)):
 
         # 生成禁用目标神经元后的文本
         # 假设目标层为 model.model.layers[0]
-        hook_handle = model.model.layers[0].register_forward_hook(disable_neuron_hook)
-        try:
-            output_ids_disabled = model.generate(
-                input_ids=input_ids,
-                temperature=0.7,
-                max_length=512,
-                attention_mask=attention_mask,
-                pad_token_id=tokenizer.pad_token_id,
-                do_sample=True,
-                top_k=10
-            )
-            # 截取生成部分（去除原 prompt 部分）
-            output_ids_disabled = output_ids_disabled[:, input_ids.shape[1]:]
-            text_disabled = tokenizer.decode(output_ids_disabled[0], skip_special_tokens=True).strip()
-            print(f"禁用神经元后生成文本, 长度: {len(text_disabled)}")
-            print(f"禁用神经元后生成文本: {text_disabled}")
-        except RuntimeError as e:
-            print(f"生成禁用神经元文本过程中的 CUDA 错误: {str(e)}")
-            text_disabled = ""
-        except Exception as e:
-            print(f"生成禁用神经元文本过程中的其他错误: {str(e)}")
-            text_disabled = ""
-        hook_handle.remove()
-
-        decoded_texts.append({"normal": text_normal, "disabled": text_disabled})
+        # hook_handle = model.model.layers[0].register_forward_hook(disable_neuron_hook)
+    #     try:
+    #         output_ids_disabled = model.generate(
+    #             input_ids=input_ids,
+    #             temperature=0.7,
+    #             max_length=512,
+    #             attention_mask=attention_mask,
+    #             pad_token_id=tokenizer.pad_token_id,
+    #             do_sample=True,
+    #             top_k=10
+    #         )
+    #         # 截取生成部分（去除原 prompt 部分）
+    #         output_ids_disabled = output_ids_disabled[:, input_ids.shape[1]:]
+    #         text_disabled = tokenizer.decode(output_ids_disabled[0], skip_special_tokens=True).strip()
+    #         print(f"禁用神经元后生成文本, 长度: {len(text_disabled)}")
+    #         print(f"禁用神经元后生成文本: {text_disabled}")
+    #     except RuntimeError as e:
+    #         print(f"生成禁用神经元文本过程中的 CUDA 错误: {str(e)}")
+    #         text_disabled = ""
+    #     except Exception as e:
+    #         print(f"生成禁用神经元文本过程中的其他错误: {str(e)}")
+    #         text_disabled = ""
+    #     hook_handle.remove()
+    #
+    #     decoded_texts.append({"normal": text_normal, "disabled": text_disabled})
     except Exception as e:
         print(f"处理 prompt 时发生错误: {str(e)}")
         decoded_texts.append({"normal": "", "disabled": ""})
@@ -132,7 +150,7 @@ all_outputs = ""
 for idx, texts in enumerate(decoded_texts):
     all_outputs += f"=== Prompt {idx+1} ===\n"
     all_outputs += "【正常生成】:\n" + texts["normal"] + "\n"
-    all_outputs += "【禁用神经元后生成】:\n" + texts["disabled"] + "\n"
+    # all_outputs += "【禁用神经元后生成】:\n" + texts["disabled"] + "\n"
     all_outputs += "\n=== 分割线 ===\n\n"
 
 print("\n=== 生成过程完成 ===")
