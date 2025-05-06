@@ -586,6 +586,42 @@ def compute_rejection_prob_loss_avg_generate(
     return avg_reject_prob.mean()  # 单个平均拒绝分数
 from transformers import LogitsProcessor
 
+from torch.distributions import Categorical
+#策略梯度
+def sample_and_get_logprobs(global_y_logits, prefix_input_ids):
+    """
+    输入：
+      - global_y_logits: Tensor([N, seq_len, vocab_size])
+      - prefix_input_ids: Tensor([1, L])
+    输出：
+      - seq_logps: Tensor([N])，每条序列生成的 log‑prob 总和
+    """
+    N, seq_len, _ = global_y_logits.shape
+    input_ids = prefix_input_ids.repeat(N, 1)  # [N, L]
+    logps = []
+    for t in range(seq_len):
+        step_logits = global_y_logits[:, t, :]    # [N, V]
+        dist = Categorical(logits=step_logits)
+        token = dist.sample()                     # [N]
+        logps.append(dist.log_prob(token))        # [N]
+        input_ids = torch.cat([input_ids, token.unsqueeze(-1)], dim=1)
+    # 累加各步 log‑prob
+    seq_logps = torch.stack(logps, dim=1).sum(dim=1)  # [N]
+    return seq_logps
+#策略梯度
+def compute_policy_loss(global_reject_losses, seq_logps):
+    """
+    输入：
+      - global_reject_losses: Tensor([N])，拒绝 loss，越小越好
+      - seq_logps           : Tensor([N])，策略下的 log‑prob
+    输出：
+      - policy_loss: scalar，REINFORCE 损失
+    """
+    rewards = - global_reject_losses
+    baseline = rewards.mean().detach()
+    advantage = rewards - baseline             # [N]
+    policy_loss = - (advantage * seq_logps).mean()
+    return policy_loss
 
 #贪心搜索加权重拒绝
 def compute_rejection_prob_loss_weight_generate(
@@ -671,7 +707,7 @@ def compute_rejection_prob_loss_weight_generate(
         weighted_reject_prob = weighted_probs.sum(1) / seq_lengths.clamp(min=1)
         # weighted_reject_prob = (reject_probs.sum(dim=-1) * weights).sum(dim=-1)
 
-    return weighted_reject_prob.mean()
+    return weighted_reject_prob.mean(),weighted_reject_prob.tolist(), y_logits
 # #加权拒绝
 # def compute_rejection_prob_loss_weight_generate(
 #         y_logits,
