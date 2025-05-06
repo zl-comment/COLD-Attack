@@ -15,30 +15,32 @@ from evaluate import query_guard
 
 import re
 from typing import List, Tuple, Optional
+
 def find_most_matches(
     texts: List[str],
     keywords: List[str]
-) -> Tuple[Optional[int], int, Optional[str]]:
+) -> Tuple[int, int, str]:
     """
     在 texts 中找出匹配关键词总次数最多的文本。
 
-    返回：(下标, 匹配次数, 文本内容)
+    返回：(下标, 匹配次数, 文本内容)。
+    如果 texts 为空，返回 (-1, 0, '')。
     """
-    # 正则：严格按单词匹配
+    # 如果没有任何文本，直接返回一个默认值
+    if not texts:
+        return -1, 0, ""
+
+    # 严格按单词边界匹配
     pattern = re.compile(r"\b(" + "|".join(map(re.escape, keywords)) + r")\b")
 
-    max_count = 0
-    max_index: Optional[int] = None
-    max_text: Optional[str] = None
+    # 初始化为第一个文本
+    max_index = 0
+    max_text = texts[0]
+    max_count = -1  # 设为 -1，确保第一个循环就会被更新
 
     for i, txt in enumerate(texts):
         matches = pattern.findall(txt)
         count = len(matches)
-
-        # for m in pattern.finditer(txt):
-            # print(f"[{i}] 匹配到：{m.group(0)}，位置：{m.span()}")
-
-        # print(f"[{i}] 文本匹配数：{count}\n")
 
         if count > max_count:
             max_count = count
@@ -947,34 +949,80 @@ import torch.nn.functional as F
 
 def compute_semantic_reject_loss_steeper(
     y_logits, bad_word_ids, embedding_layer,
-    threshold=0.4, temperature=0.7, alpha=3.0
+    threshold=0.4, temperature=0.7, alpha=3.0,
+    chunk_size=128  # 控制 bad_word_ids 分块数
 ):
     batch, seq_len, _ = y_logits.shape
+    device = y_logits.device
 
-    # 1) 原始 per-token loss
-    # 1) softmax 后 cast 到 embedding_layer.weight 同样的 dtype
-    probs = F.softmax(y_logits / temperature, dim=-1).type_as(embedding_layer.weight)  # [B, L, V], same dtype as weight
-
-    # 2) 再 matmul 就不会报错了
+    # ========== Step 1: 计算预测的 embedding ==========
+    probs = F.softmax(y_logits / temperature, dim=-1).type_as(embedding_layer.weight)  # [B, L, V]
     pred_emb = torch.matmul(probs, embedding_layer.weight)  # [B, L, D]
 
+    # ========== Step 2: 获取 bad words 的 embedding ==========
     with torch.no_grad():
-        bad_tensor = torch.tensor(bad_word_ids, device=y_logits.device)
-        bad_emb = embedding_layer(bad_tensor)
-    sim = F.cosine_similarity(
-        pred_emb.unsqueeze(2), bad_emb.unsqueeze(0).unsqueeze(0), dim=-1
-    )
-    loss_per_token = F.relu(sim.max(-1).values - threshold)  # [B, L]
+        bad_tensor = torch.tensor(bad_word_ids, device=device)
+        bad_emb = embedding_layer(bad_tensor)  # [N, D]
 
-    # 2) 位置权重（归一化 idx + 更大 α）
-    idx = torch.arange(seq_len, device=y_logits.device, dtype=torch.float32)
-    idx_norm = idx / (seq_len - 1)                             # 归一化到 [0,1]
-    pos_weights = torch.exp(-alpha * idx_norm)                # 越前越大，尾部≈e^{-α}
+    # ========== Step 3: 分块计算 cosine 相似度 ==========
+    max_sims = torch.full((batch, seq_len), -float("inf"), device=device)
 
-    # 3) 加权 + 归一化
-    weighted = loss_per_token * pos_weights.unsqueeze(0)
+    for i in range(0, bad_emb.size(0), chunk_size):
+        chunk = bad_emb[i:i+chunk_size]  # [C, D]
+        sim_chunk = F.cosine_similarity(
+            pred_emb.unsqueeze(2),               # [B, L, 1, D]
+            chunk.unsqueeze(0).unsqueeze(0),     # [1, 1, C, D]
+            dim=-1                               # → [B, L, C]
+        )
+        max_sims = torch.maximum(max_sims, sim_chunk.max(dim=-1).values)  # [B, L]
+
+    # ========== Step 4: Loss per token ==========
+    loss_per_token = F.relu(max_sims - threshold)  # [B, L]
+
+    # ========== Step 5: 位置权重 ==========
+    idx = torch.arange(seq_len, device=device, dtype=torch.float32)
+    idx_norm = idx / (seq_len - 1)
+    pos_weights = torch.exp(-alpha * idx_norm)  # [L]
+
+    # ========== Step 6: 加权并平均 ==========
+    weighted = loss_per_token * pos_weights.unsqueeze(0)  # [B, L]
     loss = (weighted.sum(dim=1) / pos_weights.sum()).mean()
+
     return loss
+#
+# import torch
+# import torch.nn.functional as F
+#
+# def compute_semantic_reject_loss_steeper(
+#     y_logits, bad_word_ids, embedding_layer,
+#     threshold=0.4, temperature=0.7, alpha=3.0
+# ):
+#     batch, seq_len, _ = y_logits.shape
+#
+#     # 1) 原始 per-token loss
+#     # 1) softmax 后 cast 到 embedding_layer.weight 同样的 dtype
+#     probs = F.softmax(y_logits / temperature, dim=-1).type_as(embedding_layer.weight)  # [B, L, V], same dtype as weight
+#
+#     # 2) 再 matmul 就不会报错了
+#     pred_emb = torch.matmul(probs, embedding_layer.weight)  # [B, L, D]
+#
+#     with torch.no_grad():
+#         bad_tensor = torch.tensor(bad_word_ids, device=y_logits.device)
+#         bad_emb = embedding_layer(bad_tensor)
+#     sim = F.cosine_similarity(
+#         pred_emb.unsqueeze(2), bad_emb.unsqueeze(0).unsqueeze(0), dim=-1
+#     )
+#     loss_per_token = F.relu(sim.max(-1).values - threshold)  # [B, L]
+#
+#     # 2) 位置权重（归一化 idx + 更大 α）
+#     idx = torch.arange(seq_len, device=y_logits.device, dtype=torch.float32)
+#     idx_norm = idx / (seq_len - 1)                             # 归一化到 [0,1]
+#     pos_weights = torch.exp(-alpha * idx_norm)                # 越前越大，尾部≈e^{-α}
+#
+#     # 3) 加权 + 归一化
+#     weighted = loss_per_token * pos_weights.unsqueeze(0)
+#     loss = (weighted.sum(dim=1) / pos_weights.sum()).mean()
+#     return loss
 
 def compute_semantic_reject_loss(y_logits, bad_word_ids, embedding_layer, threshold=0.4, temperature=0.7):
     """
