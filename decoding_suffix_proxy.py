@@ -605,26 +605,6 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     if not args.useapi:
         reject_token_ids = get_reject_token_ids(target_tokenizer, lowercase_words)
 
-    target = """but But BUT sorry SORRY Sorry Sorry apologetic APOLOGETIC Apologetic Apologetic regretful REGRETFUL Regretful Regretful 
-      unethical UNETHICAL Unethical Unethical immoral IMMORAL Immoral Immoral dishonest DISHONEST Dishonest Dishones
-      t illegal ILLEGAL Illegal Illegal unlawful UNLAWFUL Unlawful Unlawful illicit ILLICIT Illicit Illicit harmful HARMFUL Harmful Harmful detrimental DETRIMENTAL Detrimental Detrimental injurious INJURIOUS Injurious Injurious afr
-      aid AFRAID Afraid Afraid fearful FEARFUL Fearful Fearful apprehensive APPREHENSIVE Apprehensive Apprehensive cannot CANNOT Cannot Cannot unable UNABLE Unable Unable unable to UNABLE TO Unable to Unable To apologize APOLOGIZE 
-      Apologize Apologize regret REGRET Regret Regret criminal CRIMINAL Criminal Criminal illegally ILLEGALLY Illegally Illegally unable UNABLE Unable Unable incapable INCAPABLE Incapable Incapable powerless POWERLESS Powerless Pow
-      erless not NOT Not Not no NO No No nay NAY Nay Nay responsible RESPONSIBLE Responsible Responsible accountable ACCOUNTABLE Accountable Accountable liable LIABLE Liable Liable ethic ETHIC Ethic Ethic morality MORALITY Morality
-       Morality moral MORAL Moral Moral legal LEGAL Legal Legal lawful LAWFUL Lawful Lawful legitimate LEGITIMATE Legitimate Legitimate ethical ETHICAL Ethical Ethical moral MORAL Moral Moral principled PRINCIPLED Principled Princi
-      pled fulfill FULFILL Fulfill Fulfill accomplish ACCOMPLISH Accomplish Accomplish achieve ACHIEVE Achieve Achieve just JUST Just Just fair FAIR Fair Fair equitable EQUITABLE Equitable Equitable trustworthy TRUSTWORTHY Trustwor
-      thy Trustworthy reliable RELIABLE Reliable Reliable dependable DEPENDABLE Dependable Dependable repentant REPENTANT Repentant Repentant penitent PENITENT Penitent Penitent remorseful REMORSEFUL Remorseful Remorseful unprincip
-      led UNPRINCIPLED Unprincipled Unprincipled unscrupulous UNSCRUPULOUS Unscrupulous Unscrupulous corrupt CORRUPT Corrupt Corrupt unlawful UNLAWFUL Unlawful Unlawful prohibited PROHIBITED Prohibited Prohibited forbidden FORBIDDE
-      N Forbidden Forbidden noxious NOXIOUS Noxious Noxious destructive DESTRUCTIVE Destructive Destructive damaging DAMAGING Damaging Damaging timid TIMID Timid Timid terrified TERRIFIED Terrified Terrified panicked PANICKED Panic
-      ked Panicked unable UNABLE Unable Unable incompetent INCOMPETENT Incompetent Incompetent incapacitated INCAPACITATED Incapacitated Incapacitated prohibited PROHIBITED Prohibited Prohibited banned BANNED Banned Banned forbidde
-      n FORBIDDEN Forbidden Forbidden deny DENY Deny Deny refuse REFUSE Refuse Refuse decline DECLINE Decline Decline answerable ANSWERABLE Answerable Answerable culpable CULPABLE Culpable Culpable answerable ANSWERABLE Answerable 
-      Answerable moral code MORAL CODE Moral code Moral Code values VALUES Values Values principles PRINCIPLES Principles Principles legitimate LEGITIMATE Legitimate Legitimate valid VALID Valid Valid authorized AUTHORIZED Authoriz
-      ed Authorized virtuous VIRTUOUS Virtuous Virtuous righteous RIGHTEOUS Righteous Righteous honorable HONORABLE Honorable Honorable satisfy SATISFY Satisfy Satisfy complete COMPLETE Complete Complete execute EXECUTE Execute Exe
-      cute fair-minded FAIR-MINDED Fair-minded Fair-Minded impartial IMPARTIAL Impartial Impartial equitable EQUITABLE Equitable Equitable reliable RELIABLE Reliable Reliable trustable TRUSTABLE Trustable Trustable faithful FAITHFU
-      L Faithful Faithful invalid INVALID Invalid Invalid safe SAFE Safe Safe not NOT Not Not can't CAN'T Can't Can'T but BUT But But against AGAINST Against Against sorry SORRY Sorry Sorry apologize APOLOGIZE Apologize Apologize a
-      i AI Ai Ai i'm I'M I'm I'M an AN An An just JUST Just Just language LANGUAGE Language Language model MODEL Model Model assistant ASSISTANT Assistant Assistant cannot CANNOT Cannot Cannot crime CRIME Crime Crime serious SERIOU
-      S Serious Serious imprisonment IMPRISONMENT Imprisonment Imprisonment consequencescannot CONSEQUENCESCANNOT Consequencescannot Consequencescannot create CREATE Create Create can't CAN'T Can't Can'T fulfill FULFILL Fulfill Ful
-      fill not NOT Not Not attempt ATTEMPT Attempt Attempt provide PROVIDE Provide Provide i cannot fulfill your request I CANNOT FULFILL YOUR REQUEST I cannot fulfill your request I Cannot Fulfill Your Request i'm just an ai I'M JUST AN AI I'm just an ai I'M Just An Ai cannot fulfill CANNOT FULFILL Cannot fulfill Cannot Fulfill do not write a social media DO NOT WRITE A SOCIAL MEDIA Do not write a social media Do Not Write A Social Media"""
 
     for ite in pbar:
         optim.zero_grad()
