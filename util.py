@@ -555,22 +555,12 @@ def soft_forward(model, x_onehot, y_logits, topk, extra_mask=None, x_past=None, 
         return logits_so_far
 
 
-
-def soft_forward_xyz(model, x_onehot, y_logits, z_onehot):
-    '''
-    computes logits for $y$, based on a fixed context $y$ and the current logit distribution of $y$
-    :param model:
-    :param x_onehot:
-    :param y_logits:
-    :return:
-    '''
-    #
-    # print("Shape of model.get_input_embeddings().weight:", model.get_input_embeddings().weight.shape)
-    # print("Shape of y_logits:", y_logits.shape)
-    # print("Shape of x_onehot:", x_onehot.shape)
-    # print("Shape of z_onehot:", z_onehot.shape)
-    # print("Shape of device (y_logits.device):", y_logits.device)
-
+def soft_forward_xyz(model, x_onehot, y_logits, z_onehot, fp16=False, max_tokens=1024):
+    """
+    Computes logits for x + y + z by constructing soft embeddings.
+    Optionally truncates the total sequence to max_tokens and supports fp16 to reduce memory.
+    """
+    # 构建拼接嵌入
     xyz_embeds = embed_inputs(
         model.get_input_embeddings().weight,
         y_logits,
@@ -578,12 +568,55 @@ def soft_forward_xyz(model, x_onehot, y_logits, z_onehot):
         z_onehot=z_onehot,
         device=y_logits.device
     )
+
+    # 半精度处理
+    if fp16:
+        model = model.half()
+        xyz_embeds = xyz_embeds.half()
+
+    # 显存安全：截断长序列
+    if max_tokens is not None and xyz_embeds.shape[1] > max_tokens:
+        xyz_embeds = xyz_embeds[:, :max_tokens, :]
+
+    # 前向推理
     xyz_logits = model(inputs_embeds=xyz_embeds).logits
+
+    # 计算 xy 前缀长度（用于后续截取 logits）
     if x_onehot is not None:
         xy_length = x_onehot.shape[1] + y_logits.shape[1]
     else:
         xy_length = y_logits.shape[1]
+
     return xyz_logits, xy_length
+
+# def soft_forward_xyz(model, x_onehot, y_logits, z_onehot):
+#     '''
+#     computes logits for $y$, based on a fixed context $y$ and the current logit distribution of $y$
+#     :param model:
+#     :param x_onehot:
+#     :param y_logits:
+#     :return:
+#     '''
+#     #
+#     # print("Shape of model.get_input_embeddings().weight:", model.get_input_embeddings().weight.shape)
+#     # print("Shape of y_logits:", y_logits.shape)
+#     # print("Shape of x_onehot:", x_onehot.shape)
+#     # print("Shape of z_onehot:", z_onehot.shape)
+#     # print("Shape of device (y_logits.device):", y_logits.device)
+#
+#     xyz_embeds = embed_inputs(
+#         model.get_input_embeddings().weight,
+#         y_logits,
+#         x_onehot=x_onehot,
+#         z_onehot=z_onehot,
+#         device=y_logits.device
+#     )
+#     xyz_logits = model(inputs_embeds=xyz_embeds).logits
+#     if x_onehot is not None:
+#         xy_length = x_onehot.shape[1] + y_logits.shape[1]
+#     else:
+#         xy_length = y_logits.shape[1]
+#     return xyz_logits, xy_length
 
 def soft_forward_xyz_target(model, x_onehot, y_logits, z_onehot, target_onehot):
     '''
