@@ -41,7 +41,6 @@ import re
 from evaluate import CustomOllamaClient
 from collections import defaultdict
 from model.model_loader import load_proxy_model
-import torch_optimizer as torch_optim
 from award.utils import ReturnStruct
 import torch
 import torch.nn as nn
@@ -56,8 +55,6 @@ stop_words = set(stopwords.words('english'))
 
 proxy_models_little = ["output_hf-v1"]
 import torch
-import torch.nn as nn
-#import torch
 import torch.nn as nn
 #
 # class UncertaintyWeighting(nn.Module):
@@ -127,7 +124,10 @@ class UncertaintyWeighting(nn.Module):
             if loss is None:
                 scalar_losses.append(None)
             else:
-                scalar_losses.append(loss.mean() if loss.dim() > 0 else loss)
+                if isinstance(loss, torch.Tensor):
+                    scalar_losses.append(loss.mean() if loss.dim() > 0 else loss)
+                else:
+                    scalar_losses.append(loss)
 
         # 2. 根据 current_step 决定用前 4 项还是所有 5 项
         if current_step < self.switch_step or scalar_losses[4] is None:
@@ -605,6 +605,27 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     if not args.useapi:
         reject_token_ids = get_reject_token_ids(target_tokenizer, lowercase_words)
 
+    target = """but But BUT sorry SORRY Sorry Sorry apologetic APOLOGETIC Apologetic Apologetic regretful REGRETFUL Regretful Regretful 
+      unethical UNETHICAL Unethical Unethical immoral IMMORAL Immoral Immoral dishonest DISHONEST Dishonest Dishones
+      t illegal ILLEGAL Illegal Illegal unlawful UNLAWFUL Unlawful Unlawful illicit ILLICIT Illicit Illicit harmful HARMFUL Harmful Harmful detrimental DETRIMENTAL Detrimental Detrimental injurious INJURIOUS Injurious Injurious afr
+      aid AFRAID Afraid Afraid fearful FEARFUL Fearful Fearful apprehensive APPREHENSIVE Apprehensive Apprehensive cannot CANNOT Cannot Cannot unable UNABLE Unable Unable unable to UNABLE TO Unable to Unable To apologize APOLOGIZE 
+      Apologize Apologize regret REGRET Regret Regret criminal CRIMINAL Criminal Criminal illegally ILLEGALLY Illegally Illegally unable UNABLE Unable Unable incapable INCAPABLE Incapable Incapable powerless POWERLESS Powerless Pow
+      erless not NOT Not Not no NO No No nay NAY Nay Nay responsible RESPONSIBLE Responsible Responsible accountable ACCOUNTABLE Accountable Accountable liable LIABLE Liable Liable ethic ETHIC Ethic Ethic morality MORALITY Morality
+       Morality moral MORAL Moral Moral legal LEGAL Legal Legal lawful LAWFUL Lawful Lawful legitimate LEGITIMATE Legitimate Legitimate ethical ETHICAL Ethical Ethical moral MORAL Moral Moral principled PRINCIPLED Principled Princi
+      pled fulfill FULFILL Fulfill Fulfill accomplish ACCOMPLISH Accomplish Accomplish achieve ACHIEVE Achieve Achieve just JUST Just Just fair FAIR Fair Fair equitable EQUITABLE Equitable Equitable trustworthy TRUSTWORTHY Trustwor
+      thy Trustworthy reliable RELIABLE Reliable Reliable dependable DEPENDABLE Dependable Dependable repentant REPENTANT Repentant Repentant penitent PENITENT Penitent Penitent remorseful REMORSEFUL Remorseful Remorseful unprincip
+      led UNPRINCIPLED Unprincipled Unprincipled unscrupulous UNSCRUPULOUS Unscrupulous Unscrupulous corrupt CORRUPT Corrupt Corrupt unlawful UNLAWFUL Unlawful Unlawful prohibited PROHIBITED Prohibited Prohibited forbidden FORBIDDE
+      N Forbidden Forbidden noxious NOXIOUS Noxious Noxious destructive DESTRUCTIVE Destructive Destructive damaging DAMAGING Damaging Damaging timid TIMID Timid Timid terrified TERRIFIED Terrified Terrified panicked PANICKED Panic
+      ked Panicked unable UNABLE Unable Unable incompetent INCOMPETENT Incompetent Incompetent incapacitated INCAPACITATED Incapacitated Incapacitated prohibited PROHIBITED Prohibited Prohibited banned BANNED Banned Banned forbidde
+      n FORBIDDEN Forbidden Forbidden deny DENY Deny Deny refuse REFUSE Refuse Refuse decline DECLINE Decline Decline answerable ANSWERABLE Answerable Answerable culpable CULPABLE Culpable Culpable answerable ANSWERABLE Answerable 
+      Answerable moral code MORAL CODE Moral code Moral Code values VALUES Values Values principles PRINCIPLES Principles Principles legitimate LEGITIMATE Legitimate Legitimate valid VALID Valid Valid authorized AUTHORIZED Authoriz
+      ed Authorized virtuous VIRTUOUS Virtuous Virtuous righteous RIGHTEOUS Righteous Righteous honorable HONORABLE Honorable Honorable satisfy SATISFY Satisfy Satisfy complete COMPLETE Complete Complete execute EXECUTE Execute Exe
+      cute fair-minded FAIR-MINDED Fair-minded Fair-Minded impartial IMPARTIAL Impartial Impartial equitable EQUITABLE Equitable Equitable reliable RELIABLE Reliable Reliable trustable TRUSTABLE Trustable Trustable faithful FAITHFU
+      L Faithful Faithful invalid INVALID Invalid Invalid safe SAFE Safe Safe not NOT Not Not can't CAN'T Can't Can'T but BUT But But against AGAINST Against Against sorry SORRY Sorry Sorry apologize APOLOGIZE Apologize Apologize a
+      i AI Ai Ai i'm I'M I'm I'M an AN An An just JUST Just Just language LANGUAGE Language Language model MODEL Model Model assistant ASSISTANT Assistant Assistant cannot CANNOT Cannot Cannot crime CRIME Crime Crime serious SERIOU
+      S Serious Serious imprisonment IMPRISONMENT Imprisonment Imprisonment consequencescannot CONSEQUENCESCANNOT Consequencescannot Consequencescannot create CREATE Create Create can't CAN'T Can't Can'T fulfill FULFILL Fulfill Ful
+      fill not NOT Not Not attempt ATTEMPT Attempt Attempt provide PROVIDE Provide Provide i cannot fulfill your request I CANNOT FULFILL YOUR REQUEST I cannot fulfill your request I Cannot Fulfill Your Request i'm just an ai I'M JUST AN AI I'm just an ai I'M Just An Ai cannot fulfill CANNOT FULFILL Cannot fulfill Cannot Fulfill do not write a social media DO NOT WRITE A SOCIAL MEDIA Do not write a social media Do Not Write A Social Media"""
+
     for ite in pbar:
         optim.zero_grad()
         y_logits_ = y_logits + epsilon
@@ -696,14 +717,26 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 _,_,text = find_most_matches(text, keywords)
 
                 prompt = x + " " + text
+                #
                 loss, predicted_tokens = compute_fine_grained_loss(
                     model_name=args.pretrained_model,
                     base_prompt=prompt,
-                    target=z,
+                    target=k,
                     api=target_model_path,
                     temperature=0.7
                 )
-                hes_loss = hesitation_loss_continuous(loss, target=0.5)
+                if isinstance(loss, float):
+                    if math.isnan(loss):
+                        loss = 0.0
+                    if math.isinf(loss):
+                        loss = 0.0
+                    loss = torch.tensor(loss, requires_grad=True, device=device)
+                    #如果loss极小代表效果
+
+
+                print("loss",loss)
+                loss =  100 - loss #将最大化变为最小化
+                hes_loss = loss*0.01*1/5    #要让这个loss越来越小
             hes_weight = 5000  # 加强拒绝概率的惩罚
             loss5 = hes_weight * hes_loss
 
@@ -723,7 +756,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             target_idx=bad_words_t,
             ngram_list=[1]
         )
-        #
+
 
         progress = ite / args.num_iters
         # flu_weight = 50 * (1.0 + 0.2 * progress)  # 适当降低流畅性权重
@@ -754,7 +787,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         # loss3 = - rej_weight * c_loss_2  # BLEU/约束相关损失（注意这里是负的）
         # 经验常数 C
         C = 1000.0
-        loss3 = rej_weight * (C - bleu_loss)  # ∈ [40, 350] 左右，非负
+        loss3 = rej_weight * (C - bleu_loss)  # ∈ [40, 350] 左右，非负  将最大化变为最小化
 
         loss4 = kl_loss_weight * sem_loss  # 语义拒绝/KL损失
         # loss5 = 100 * p_reject  # 犹豫loss
@@ -776,8 +809,18 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         # print("loss", loss)
         # 如果不是最后一次迭代，进行反向传播和优化
         if ite < args.num_iters - 1:
-            loss.backward()
-        # 在 loss.backward() 后添加
+            try:
+                torch.cuda.empty_cache()  # 清理之前的缓存
+                loss.backward()
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print("[OOM] during loss.backward(). Try reducing batch or chunk_size.")
+                    torch.cuda.empty_cache()
+                    raise
+                else:
+                    raise
+
+            # 在 loss.backward() 后添加
             torch.nn.utils.clip_grad_norm_([epsilon], max_norm=1.0)
 
 
@@ -819,6 +862,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 api_texts = call_api_completion(args.pretrained_model, args.api, prompts, max_tokens=512,
                                                 temperature=0.7)
                 print(f"成功通过 API 批量生成文本, 生成结果数: {len(api_texts)}")
+                # print("api输出：",api_texts)
 
 
 
