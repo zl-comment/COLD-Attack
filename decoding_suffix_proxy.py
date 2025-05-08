@@ -93,7 +93,7 @@ class UncertaintyWeighting(nn.Module):
         highlight_idx: int = 2,
         target_lambda: float = -1.0,
         gamma: float = 1.0,
-        switch_step: int = 1000
+        switch_step: int = 0
     ):
         """
         highlight_idx: 要持续突出的损失索引（0-based，2 对应 loss3）
@@ -564,7 +564,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     # 初始化（放在模型定义部分）
     # loss_balancer = UncertaintyWeighting().to(device)
     # 突出第3项(loss3)，让 λ₃ 靠近 -2.0，正则强度 γ=0.5
-    loss_balancer = UncertaintyWeighting(highlight_idx=3, target_lambda=-2.0, gamma=0.5,switch_step = 1000).to(device)
+    loss_balancer = UncertaintyWeighting(highlight_idx=2, target_lambda=-2.0, gamma=0.5,switch_step = 0).to(device)
     epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32), requires_grad=True)
     #原来的
     optim = torch.optim.AdamW(
@@ -619,7 +619,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             if mask_t is None:
                 soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
             else:
-                soft_forward_y = top_k_filter_3d(y_logits_, args.topk, mask=mask_t, extra_mask=None, bad_mask=None) / 0.001
+                soft_forward_y = top_k_compensate(y_logits_, args.topk, mask=mask_t, extra_mask=None, bad_mask=None) / 0.001
         if args.fp16:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 y_logits_t = soft_forward(proxy_model, soft_forward_x, soft_forward_y, args.topk, extra_mask=None,
@@ -633,7 +633,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         else:
             _, indices_t = torch.topk(y_logits_t, args.topk)
             mask_t = torch.zeros_like(y_logits_t).scatter_(2, indices_t, 1)
-        flu_loss = soft_nll(top_k_filter_3d(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=None, bad_mask=None),
+        flu_loss = soft_nll(top_k_compensate(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=None, bad_mask=None),
                             y_logits_ / args.input_lgt_temp)
         soft_forward_y_ = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
         if args.fp16:
@@ -726,26 +726,73 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         # ========== 每轮 ite >= 1000 时执行 ==========
         if ite >= 1000:
             if not args.useapi:
-                # 当前批次计算
-                reject_loss, batch_reject_losses, batch_y_logits = compute_rejection_prob_loss_weight_generate(
-                    y_logits_,
-                    proxy_tokenizer,
-                    target_model,
-                    target_tokenizer,
-                    target_model.device,
-                    reject_token_ids
-                )
+                from torch.distributions import Categorical
 
-                # 确保 batch_y_logits 是 tensor
-                if isinstance(batch_y_logits, list):
-                    batch_y_logits = torch.stack(batch_y_logits)
 
-                batch_reject_losses_tensor = torch.tensor(batch_reject_losses, device=batch_y_logits.device)
+                # 2) 从 y_logits_ 里采样 N 条序列，并记录 log‑prob
+                N, T, V = y_logits_.shape
+                logps_list = []
+                tokens = []
+                for t in range(T):
+                    # 每个 step 直接用扰动后 logits 采样
+                    step_logits = y_logits_[:, t, :]  # [N, V]
+                    dist = Categorical(logits=step_logits)
+                    tok = dist.sample()  # [N]
+                    logps_list.append(dist.log_prob(tok))
+                    tokens.append(tok)
+                seq_logps = torch.stack(logps_list, dim=1).sum(dim=1)  # [N]
+                generated_ids = torch.stack(tokens, dim=1)  # [N, T]
+
+                # 3) 黑盒 target_model 评判 → 得到 batch_reject_losses: [N]
+                with torch.no_grad():
+                    _, batch_reject_losses, _ = compute_rejection_prob_loss_weight_generate(
+                        generated_ids,
+                        proxy_tokenizer,
+                        target_model,
+                        target_tokenizer,
+                        target_model.device,
+                        reject_token_ids,
+                        max_new_tokens=T
+                    )
+                batch_reject_losses = torch.tensor(batch_reject_losses,
+                                                   device=seq_logps.device)
+
+                # 4) 策略梯度损失（REINFORCE）
+                rewards = - batch_reject_losses
+                baseline = rewards.mean().detach()
+                advantage = rewards - baseline
+                policy_loss = - (advantage * seq_logps).mean()
+                C=300
+                # min_val = policy_loss.min().detach()  # negative or zero
+                # # 只有当 min_val < 0 时才平移，否则不变
+                # shift = torch.clamp(-min_val, min=0)
+                hes_loss = policy_loss + C  # 现在 loss5 ≥ 0，且保留了 policy_loss 之间的差距
+
+
+                # # 当前批次计算
+                #被注释的函数在reaward
+                # reject_loss, batch_reject_losses, batch_y_logits = compute_rejection_prob_loss_weight_generate(
+                #     y_logits_,
+                #     proxy_tokenizer,
+                #     target_model,
+                #     target_tokenizer,
+                #     target_model.device,
+                #     reject_token_ids
+                # )
+                #batch_y_logits的维度为3才对
+                # if batch_y_logits.dim() == 2:
+                #     batch_y_logits = batch_y_logits.unsqueeze(-1).expand(-1, -1, proxy_model.config.vocab_size)
+                # # 确保 batch_y_logits 是 tensor
+                #
+                # if isinstance(batch_y_logits, list):
+                #     batch_y_logits = torch.stack(batch_y_logits)
+
+                batch_reject_losses_tensor = torch.tensor(batch_reject_losses, device=seq_logps.device)
 
                 # 当前批次
                 N = args.batch_size
                 _, batch_indices = torch.topk(batch_reject_losses_tensor, k=N, largest=False)
-                selected_y_logits = batch_y_logits[batch_indices]
+                selected_y_logits = y_logits_[batch_indices]
                 selected_reject_losses = batch_reject_losses_tensor[batch_indices]
 
 
@@ -767,13 +814,14 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 indices = torch.multinomial(probs, num_samples=N, replacement=False)
                 global_y_logits = global_y_logits[indices]
                 global_reject_losses = global_reject_losses[indices]
-
-                # 用全局最小的平均值计算 hes_loss
-                threshold = 0.015
-                # 只对超出阈值的部分计算 loss，没超的不惩罚
-                excess = torch.relu(global_reject_losses - threshold)  # 超出多少就惩罚多少
-                hes_loss = hesitation_loss_continuous(excess.mean(), target=threshold)
-
+                #
+                # # 用全局最小的平均值计算 hes_loss
+                # threshold = 0.015
+                # # 只对超出阈值的部分计算 loss，没超的不惩罚
+                # excess = torch.relu(global_reject_losses - threshold)  # 超出多少就惩罚多少
+                # hes_loss = hesitation_loss_continuous(excess.mean(), target=threshold)
+                hes_weight = 1
+                loss5 = hes_weight * hes_loss
 
             else:
                 text, _, last_text_ids = decode_with_model_topk(
@@ -803,8 +851,14 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 loss = 100 - loss
                 hes_loss = loss * 0.01 * 1 / 5
 
-            hes_weight = 5000
-            loss5 = hes_weight * hes_loss
+                hes_weight = 5000
+                loss5 = hes_weight * hes_loss
+
+            if torch.isnan(loss5):
+                print("Warning: loss5 is NaN, resetting to zero")
+
+
+
 
         # 在计算 reject_loss 后，计算每个样本的拒绝概率向量
         # p_reject = compute_rejection_prob_weighted(y_logits, reject_token_ids, k=5, device=device)
@@ -858,6 +912,12 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         loss4 = kl_loss_weight * sem_loss  # 语义拒绝/KL损失
         # loss5 = 100 * p_reject  # 犹豫loss
 
+        if torch.isnan(c_loss_1).any():
+            print("Warning: c_loss_1 is NaN, resetting to zero")
+        if torch.isnan(flu_loss).any():
+            print("Warning: flu_loss is NaN, resetting to zero")
+        if torch.isnan(bleu_loss).any():
+            print("Warning: bleu_loss is NaN, resetting to zero")
         if ite >= 1000:
         # 替换你的损失计算部分（训练循环中）
             loss_total = loss_balancer(loss1, loss2,loss3,loss4, loss5,current_step=ite)
@@ -886,17 +946,19 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 else:
                     raise
 
-            # 在 loss.backward() 后添加
-            torch.nn.utils.clip_grad_norm_([epsilon], max_norm=1.0)
+
 
 
 
             optim.step()
+            with torch.no_grad():
+                # element‐wise clamp，把每个分量限制到 [–10000,10000]
+                epsilon.clamp_(-10000.0, 10000.0)
             scheduler.step()
         #关注loss
         pbar.set_postfix(loss=loss.item())
 
-        # 定期打印生成结果
+        # # 定期打印生成结果
         if args.verbose and ((ite + 1) % args.print_every == 0 or ite == 0 or ite + 1 == args.num_iters):
             text, _, last_text_ids = decode_with_model_topk(
                 proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None, bad_mask=None)
@@ -954,6 +1016,9 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 'weights/fluency': flu_weight,
                 'weights/rejection': rej_weight,
                 'weights/kl_loss_weight': kl_loss_weight,
+                'val/norm_epsilon': epsilon.norm().item(),
+                'val/max_epsilon': epsilon.abs().max().item(),
+                'val/min_epsilon': epsilon.abs().min().item(),
                 'norm/epsilon': torch.norm(epsilon).item(),
                 'norm/y_logits': torch.norm(y_logits).item(),
                 # 'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
