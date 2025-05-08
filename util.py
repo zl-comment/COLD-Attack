@@ -69,6 +69,71 @@ def _greedy(logits):
     return last
 
 
+#添加对top_k_filter_3d的补充修改
+def top_k_compensate(
+        logits: torch.Tensor,
+        k: int,
+        probs: bool = False,
+        mask: torch.Tensor = None,
+        extra_mask: torch.Tensor = None,
+        bad_mask: torch.Tensor = None
+) -> torch.Tensor:
+    """
+    在 top_k_filter_3d 基础上，增加“若一行全被掩掉，则保留该行原始 logits 最大值位置” 的补偿。
+
+    参数:
+      - logits:     [batch, length, vocab_size]
+      - k:          top-k
+      - probs:      如果为 True，则返回 logits*mask，否则返回 logits*mask + -BIG_CONST*(1-mask)
+      - mask:       预传的 mask，若为 None 则内部构建
+      - extra_mask: shape 同 logits，1 表示额外保留
+      - bad_mask:   shape 同 logits，1 表示合法
+    返回:
+      - 同 top_k_filter_3d，但已补偿全零行
+    """
+    BIG_CONST = 1e10
+
+    # 1) 生成或合并 mask
+    if k == 0:
+        base_mask = torch.ones_like(logits)
+    else:
+        # 1.1 先按 topk 生成 mask
+        if mask is None:
+            _, topk_idx = torch.topk(logits, k, dim=-1)
+            mask = torch.zeros_like(logits).scatter_(2, topk_idx, 1.0)
+        base_mask = mask
+
+    # 1.2 结合 bad_mask / extra_mask
+    if bad_mask is not None:
+        base_mask = base_mask * bad_mask
+    if extra_mask is not None:
+        base_mask = ((base_mask + extra_mask) > 0).float()
+
+    # 2) 检测哪些位置“整行被掩掉” → 需要补偿
+    #    sum(dim=-1) 计算每个 [batch, time] 上的 mask 总和
+    zero_rows = (base_mask.sum(dim=-1) == 0)  # shape [batch, length]
+
+    if zero_rows.any():
+        # 2.1 找出 logits 在最后一维上的最大值下标 [batch, length, 1]
+        max_idx = logits.argmax(dim=-1, keepdim=True)
+
+        # 2.2 对需要补偿的行，将 mask 对应位置打开
+        #     先把这些行清零，再 scatter 最大值位置为 1
+        #     zero_rows.unsqueeze(-1) → [batch, length, 1]
+        zr = zero_rows.unsqueeze(-1).expand_as(base_mask)
+        base_mask = base_mask.clone()
+        base_mask[zr] = 0.0
+        # scatter 1 到每个 row 的 max_idx 上
+        base_mask.scatter_(2, max_idx, 1.0)
+
+    # 3) 根据 probs 参数决定输出
+    if probs:
+        return logits * base_mask
+    else:
+        # logits*mask + -BIG_CONST*(1-mask)
+        return logits * base_mask + (-BIG_CONST) * (1.0 - base_mask)
+
+
 def top_k_filter_3d(logits, k, probs=False, mask=None, extra_mask=None, bad_mask=None):
     """
     logits.shape = [batch_size, length, vocab_size]
@@ -437,7 +502,7 @@ def soft_nll(logits_perturbed, logits, eps=1e-7):
         logits: 原始logits
         eps: 数值稳定性参数
     """
-    # # 打印输入形状和值的范围
+    # # # 打印输入形状和值的范围
     # print(f"soft_nll input shapes:")
     # print(f"logits_perturbed: {logits_perturbed.shape}, range: [{logits_perturbed.min()}, {logits_perturbed.max()}]")
     # print(f"logits: {logits.shape}, range: [{logits.min()}, {logits.max()}]")
@@ -455,7 +520,7 @@ def soft_nll(logits_perturbed, logits, eps=1e-7):
     # print(f"Probability ranges:")
     # print(f"p: [{p.min()}, {p.max()}]")
     # print(f"logp: [{logp.min()}, {logp.max()}]")
-    
+
     loss = -(p * logp).sum(dim=-1).mean(dim=-1)
     
     # 打印损失值
