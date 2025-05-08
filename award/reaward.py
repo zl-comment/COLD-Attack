@@ -623,91 +623,197 @@ def compute_policy_loss(global_reject_losses, seq_logps):
     policy_loss = - (advantage * seq_logps).mean()
     return policy_loss
 
-#贪心搜索加权重拒绝
 def compute_rejection_prob_loss_weight_generate(
-        y_logits,
-        proxy_tokenizer,
-        target_model,
-        target_tokenizer,
-        target_device,
-        reject_token_ids,
-        max_new_tokens=15
+    generated_ids: torch.LongTensor,
+    proxy_tokenizer,
+    target_model,
+    target_tokenizer,
+    target_device,
+    reject_token_ids: list,
+    max_new_tokens: int = 15
 ):
-    # ==================== 1. 快速解码与生成 ====================
-    batch_ids = torch.argmax(y_logits, dim=-1)
-    texts = proxy_tokenizer.batch_decode(batch_ids, skip_special_tokens=True)
+    """
+    输入:
+      - generated_ids: Tensor([batch, seq_len])，proxy_model 生成的前缀ID序列
+      - proxy_tokenizer/target_tokenizer, target_model, device: 同原来
+      - reject_token_ids: 要惩罚的 token id 列表
+      - max_new_tokens: target_model 最多再生成多少 token
+    输出:
+      - mean_prob: 平均加权拒绝概率（scalar Tensor）
+      - probs_list: 每条样本的加权拒绝概率列表（List[float]）
+      - generated_ids: 原始传入的 generated_ids（方便外面跟踪）
+    """
 
+    # 1) 用 proxy_tokenizer 把 ID 转成文本
+    texts = proxy_tokenizer.batch_decode(
+        generated_ids,
+        skip_special_tokens=True
+    )
+
+    # 2) 编码后交给 target_model 再生成一次 reply
     inputs = target_tokenizer(
         texts,
         return_tensors="pt",
         padding=True,
         truncation=True,
-        max_length=512,
+        max_length=512
     ).to(target_device)
 
-    with torch.no_grad():
-        # ==================== 2. 高效生成 ====================
-        if target_tokenizer.pad_token_id is None:
-            target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
+    # 确保有 pad_token_id
+    if target_tokenizer.pad_token_id is None:
+        target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
 
-        generated_output = target_model.generate(
+    with torch.no_grad():
+        # 2.1 调用 generate
+        gen_out = target_model.generate(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             max_new_tokens=max_new_tokens,
-            # do_sample=False,
-            # num_beams=1,
             do_sample=True,
             temperature=0.7,
             output_scores=True,
             return_dict_in_generate=True,
-            pad_token_id=target_tokenizer.pad_token_id,  # 确保有明确的pad_token
-        logits_processor = LogitsProcessorList([SafeLogitsProcessor()])
+            pad_token_id=target_tokenizer.pad_token_id,
+            logits_processor=LogitsProcessorList([SafeLogitsProcessor()])
         )
-        generated_ids = generated_output.sequences
-        prompt_length = inputs["input_ids"].shape[1]
-        generated_ids = generated_ids[:, prompt_length:]  # 去除prompt部分
+        # 去掉 prompt 部分，保留新生成的 reply_ids
+        seq_len_in = inputs["input_ids"].shape[1]
+        reply_ids = gen_out.sequences[:, seq_len_in:]
 
-        # generated_texts = target_tokenizer.batch_decode(
-        #             generated_ids, skip_special_tokens=True
-        #         )
-        # print("generated_texts:",generated_texts)
-        # ==================== 3. 序列长度计算修复 ====================
-        # 确保pad_token_id有效
+        # 2.2 计算每条 reply 的真实长度（不计 pad）
         if target_tokenizer.pad_token_id is None:
             target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
+        seq_lengths = (reply_ids != target_tokenizer.pad_token_id).sum(dim=1)
 
-        # 正确的序列长度计算
-        seq_lengths = (generated_ids != target_tokenizer.pad_token_id).sum(dim=1).to(target_device)
+        # 2.3 拿出每步的 scores → [batch, reply_len, vocab]
+        scores = torch.stack(gen_out.scores, dim=1)  # dim=1 对应 time step
+        vocab_size = scores.size(-1)
 
-        # ==================== 4. 后续计算 ====================
-        logits = torch.stack(generated_output.scores, dim=1)
-        vocab_size = logits.size(-1)
-
+        # 2.4 只保留 reject_token_ids 在 vocab 范围内的那一部分
         valid_ids = torch.tensor(
             [i for i in reject_token_ids if i < vocab_size],
             device=target_device
         )
         if len(valid_ids) == 0:
-            return torch.tensor(0.0, device=target_device)
-        # ==================== 4. 向量化加权计算 ====================
-        # 快速概率计算（避免完整softmax）
-        reject_logits = logits[..., valid_ids]
-        reject_probs = torch.exp(reject_logits - torch.logsumexp(logits, dim=-1, keepdim=True))
+            # 没有要惩罚的 id，返回 0
+            zero = torch.zeros(generated_ids.size(0), device=target_device)
+            return zero.mean(), zero.tolist(), generated_ids
 
-        # 动态权重（根据实际生成长度调整）
+        # 3) 加权拒绝概率计算（沿用你原来的向量化逻辑）
+        # 3.1 先得到这些 reject_id 的 logits → [batch, reply_len, R]
+        reject_logits = scores[..., valid_ids]
+        # 3.2 转成概率（避免 full softmax）
+        reject_probs = torch.exp(
+            reject_logits -
+            torch.logsumexp(scores, dim=-1, keepdim=True)
+        )  # [batch, reply_len, R]
+
+        # 3.3 动态权重，根据生成长度 linearly 从 20→1
         max_len = reject_probs.size(1)
         weights = torch.linspace(20.0, 1.0, steps=max_len, device=target_device)
         weights = weights / weights.sum()
 
-        # 掩码处理（忽略padding部分）
+        # 3.4 mask 掉 padding 部分
         mask = torch.arange(max_len, device=target_device)[None, :] < seq_lengths[:, None]
-        weighted_probs = (reject_probs.sum(-1) * weights) * mask
-        #
-        # # 按实际长度归一化
-        weighted_reject_prob = weighted_probs.sum(1) / seq_lengths.clamp(min=1)
-        # weighted_reject_prob = (reject_probs.sum(dim=-1) * weights).sum(dim=-1)
+        # (reject_probs.sum(-1) * weights) * mask 每条 time step 的加权概率
+        weighted = (reject_probs.sum(dim=-1) * weights) * mask
 
-    return weighted_reject_prob.mean(),weighted_reject_prob.tolist(), y_logits
+        # 3.5 按实际长度归一化
+        weighted_reject_prob = weighted.sum(dim=1) / seq_lengths.clamp(min=1)
+
+    # 返回：平均值、列表，以及原 generated_ids 方便外面接策略梯度
+    return (
+        weighted_reject_prob.mean(),
+        weighted_reject_prob.tolist(),
+        generated_ids
+    )
+#
+# #贪心搜索加权重拒绝
+# def compute_rejection_prob_loss_weight_generate(
+#         y_logits,
+#         proxy_tokenizer,
+#         target_model,
+#         target_tokenizer,
+#         target_device,
+#         reject_token_ids,
+#         max_new_tokens=15
+# ):
+#     # ==================== 1. 快速解码与生成 ====================
+#     batch_ids = torch.argmax(y_logits, dim=-1)
+#     texts = proxy_tokenizer.batch_decode(batch_ids, skip_special_tokens=True)
+#
+#     inputs = target_tokenizer(
+#         texts,
+#         return_tensors="pt",
+#         padding=True,
+#         truncation=True,
+#         max_length=512,
+#     ).to(target_device)
+#
+#     with torch.no_grad():
+#         # ==================== 2. 高效生成 ====================
+#         if target_tokenizer.pad_token_id is None:
+#             target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
+#
+#         generated_output = target_model.generate(
+#             input_ids=inputs["input_ids"],
+#             attention_mask=inputs["attention_mask"],
+#             max_new_tokens=max_new_tokens,
+#             # do_sample=False,
+#             # num_beams=1,
+#             do_sample=True,
+#             temperature=0.7,
+#             output_scores=True,
+#             return_dict_in_generate=True,
+#             pad_token_id=target_tokenizer.pad_token_id,  # 确保有明确的pad_token
+#         logits_processor = LogitsProcessorList([SafeLogitsProcessor()])
+#         )
+#         generated_ids = generated_output.sequences
+#         prompt_length = inputs["input_ids"].shape[1]
+#         generated_ids = generated_ids[:, prompt_length:]  # 去除prompt部分
+#
+#         # generated_texts = target_tokenizer.batch_decode(
+#         #             generated_ids, skip_special_tokens=True
+#         #         )
+#         # print("generated_texts:",generated_texts)
+#         # ==================== 3. 序列长度计算修复 ====================
+#         # 确保pad_token_id有效
+#         if target_tokenizer.pad_token_id is None:
+#             target_tokenizer.pad_token_id = target_tokenizer.eos_token_id
+#
+#         # 正确的序列长度计算
+#         seq_lengths = (generated_ids != target_tokenizer.pad_token_id).sum(dim=1).to(target_device)
+#
+#         # ==================== 4. 后续计算 ====================
+#         logits = torch.stack(generated_output.scores, dim=1)
+#         vocab_size = logits.size(-1)
+#
+#         valid_ids = torch.tensor(
+#             [i for i in reject_token_ids if i < vocab_size],
+#             device=target_device
+#         )
+#         if len(valid_ids) == 0:
+#             return torch.tensor(0.0, device=target_device)
+#         # ==================== 4. 向量化加权计算 ====================
+#         # 快速概率计算（避免完整softmax）
+#         reject_logits = logits[..., valid_ids]
+#         reject_probs = torch.exp(reject_logits - torch.logsumexp(logits, dim=-1, keepdim=True))
+#
+#         # 动态权重（根据实际生成长度调整）
+#         max_len = reject_probs.size(1)
+#         weights = torch.linspace(20.0, 1.0, steps=max_len, device=target_device)
+#         weights = weights / weights.sum()
+#
+#         # 掩码处理（忽略padding部分）
+#         mask = torch.arange(max_len, device=target_device)[None, :] < seq_lengths[:, None]
+#         weighted_probs = (reject_probs.sum(-1) * weights) * mask
+#         #
+#         # # 按实际长度归一化
+#         weighted_reject_prob = weighted_probs.sum(1) / seq_lengths.clamp(min=1)
+#         # weighted_reject_prob = (reject_probs.sum(dim=-1) * weights).sum(dim=-1)
+#
+#     return weighted_reject_prob.mean(),weighted_reject_prob.tolist(), y_logits
+
 # #加权拒绝
 # def compute_rejection_prob_loss_weight_generate(
 #         y_logits,
