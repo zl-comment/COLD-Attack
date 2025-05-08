@@ -549,7 +549,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     text, _, _ = get_text_from_logits(init_logits, proxy_tokenizer)
     for bi in range(args.batch_size):
         logger.info("[initial]: %s" % (text[bi]))
-        print("[initial]: %s" % (text[bi]))
+        # print("[initial]: %s" % (text[bi]))
     # -------------------------------
     # 记录与优化设置
     # -------------------------------
@@ -724,138 +724,138 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         #     loss5 = hes_weight * hes_loss
 
         # ========== 每轮 ite >= 1000 时执行 ==========
-        if ite >= 1000:
-            if not args.useapi:
-                from torch.distributions import Categorical
+        # if ite >= 1000:
+        if not args.useapi:
+            from torch.distributions import Categorical
 
 
-                # 2) 从 y_logits_ 里采样 N 条序列，并记录 log‑prob
-                N, T, V = y_logits_.shape
-                logps_list = []
-                tokens = []
-                for t in range(T):
-                    # 每个 step 直接用扰动后 logits 采样
-                    step_logits = y_logits_[:, t, :]  # [N, V]
-                    dist = Categorical(logits=step_logits)
-                    tok = dist.sample()  # [N]
-                    logps_list.append(dist.log_prob(tok))
-                    tokens.append(tok)
-                seq_logps = torch.stack(logps_list, dim=1).sum(dim=1)  # [N]
-                generated_ids = torch.stack(tokens, dim=1)  # [N, T]
+            # 2) 从 y_logits_ 里采样 N 条序列，并记录 log‑prob
+            N, T, V = y_logits_.shape
+            logps_list = []
+            tokens = []
+            for t in range(T):
+                # 每个 step 直接用扰动后 logits 采样
+                step_logits = y_logits_[:, t, :]  # [N, V]
+                dist = Categorical(logits=step_logits)
+                tok = dist.sample()  # [N]
+                logps_list.append(dist.log_prob(tok))
+                tokens.append(tok)
+            seq_logps = torch.stack(logps_list, dim=1).sum(dim=1)  # [N]
+            generated_ids = torch.stack(tokens, dim=1)  # [N, T]
 
-                # 3) 黑盒 target_model 评判 → 得到 batch_reject_losses: [N]
-                with torch.no_grad():
-                    _, batch_reject_losses, _ = compute_rejection_prob_loss_weight_generate(
-                        generated_ids,
-                        proxy_tokenizer,
-                        target_model,
-                        target_tokenizer,
-                        target_model.device,
-                        reject_token_ids,
-                        max_new_tokens=T
-                    )
-                batch_reject_losses = torch.tensor(batch_reject_losses,
-                                                   device=seq_logps.device)
-
-                # 4) 策略梯度损失（REINFORCE）
-                rewards = - batch_reject_losses
-                baseline = rewards.mean().detach()
-                advantage = rewards - baseline
-                policy_loss = - (advantage * seq_logps).mean()
-                C=300
-                # min_val = policy_loss.min().detach()  # negative or zero
-                # # 只有当 min_val < 0 时才平移，否则不变
-                # shift = torch.clamp(-min_val, min=0)
-                hes_loss = policy_loss + C  # 现在 loss5 ≥ 0，且保留了 policy_loss 之间的差距
-
-
-                # # 当前批次计算
-                #被注释的函数在reaward
-                # reject_loss, batch_reject_losses, batch_y_logits = compute_rejection_prob_loss_weight_generate(
-                #     y_logits_,
-                #     proxy_tokenizer,
-                #     target_model,
-                #     target_tokenizer,
-                #     target_model.device,
-                #     reject_token_ids
-                # )
-                #batch_y_logits的维度为3才对
-                # if batch_y_logits.dim() == 2:
-                #     batch_y_logits = batch_y_logits.unsqueeze(-1).expand(-1, -1, proxy_model.config.vocab_size)
-                # # 确保 batch_y_logits 是 tensor
-                #
-                # if isinstance(batch_y_logits, list):
-                #     batch_y_logits = torch.stack(batch_y_logits)
-
-                batch_reject_losses_tensor = torch.tensor(batch_reject_losses, device=seq_logps.device)
-
-                # 当前批次
-                N = args.batch_size
-                _, batch_indices = torch.topk(batch_reject_losses_tensor, k=N, largest=False)
-                selected_y_logits = y_logits_[batch_indices]
-                selected_reject_losses = batch_reject_losses_tensor[batch_indices]
-
-
-                # 把当前批次的加入全局 tensor
-                if global_y_logits is None:
-                    global_y_logits = selected_y_logits  # [N, seq_len, vocab_size]
-                    global_reject_losses = selected_reject_losses  # [N]
-                else:
-                    global_y_logits = torch.cat([global_y_logits, selected_y_logits], dim=0)
-                    global_reject_losses = torch.cat([global_reject_losses, selected_reject_losses], dim=0)
-
-                # 从全局里选出最小 N 个
-                # _, global_indices = torch.topk(global_reject_losses, k=N, largest=False)
-                # global_y_logits = global_y_logits[global_indices]
-                # global_reject_losses = global_reject_losses[global_indices]
-                weights = -global_reject_losses
-                temperature = 1.0
-                probs = torch.softmax(weights / temperature, dim=0)
-                indices = torch.multinomial(probs, num_samples=N, replacement=False)
-                global_y_logits = global_y_logits[indices]
-                global_reject_losses = global_reject_losses[indices]
-                #
-                # # 用全局最小的平均值计算 hes_loss
-                # threshold = 0.015
-                # # 只对超出阈值的部分计算 loss，没超的不惩罚
-                # excess = torch.relu(global_reject_losses - threshold)  # 超出多少就惩罚多少
-                # hes_loss = hesitation_loss_continuous(excess.mean(), target=threshold)
-                hes_weight = 1
-                loss5 = hes_weight * hes_loss
-
-            else:
-                text, _, last_text_ids = decode_with_model_topk(
-                    proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
-                    bad_mask=None)
-
-                keywords = lowercase_words
-                _, _, text = find_most_matches(text, keywords)
-
-                prompt = x + " " + text
-
-                loss, predicted_tokens = compute_fine_grained_loss(
-                    model_name=args.pretrained_model,
-                    base_prompt=prompt,
-                    target=k,
-                    api=target_model_path,
-                    temperature=0.7
+            # 3) 黑盒 target_model 评判 → 得到 batch_reject_losses: [N]
+            with torch.no_grad():
+                _, batch_reject_losses, _ = compute_rejection_prob_loss_weight_generate(
+                    generated_ids,
+                    proxy_tokenizer,
+                    target_model,
+                    target_tokenizer,
+                    target_model.device,
+                    reject_token_ids,
+                    max_new_tokens=T
                 )
-                if isinstance(loss, float):
-                    if math.isnan(loss):
-                        loss = 0.0
-                    if math.isinf(loss):
-                        loss = 0.0
-                    loss = torch.tensor(loss, requires_grad=True, device=device)
+            batch_reject_losses = torch.tensor(batch_reject_losses,
+                                               device=seq_logps.device)
 
-                print("loss", loss)
-                loss = 100 - loss
-                hes_loss = loss * 0.01 * 1 / 5
+            # 4) 策略梯度损失（REINFORCE）
+            rewards = - batch_reject_losses
+            baseline = rewards.mean().detach()
+            advantage = rewards - baseline
+            policy_loss = - (advantage * seq_logps).mean()
+            C=300
+            # min_val = policy_loss.min().detach()  # negative or zero
+            # # 只有当 min_val < 0 时才平移，否则不变
+            # shift = torch.clamp(-min_val, min=0)
+            hes_loss = policy_loss + C  # 现在 loss5 ≥ 0，且保留了 policy_loss 之间的差距
 
-                hes_weight = 5000
-                loss5 = hes_weight * hes_loss
 
-            if torch.isnan(loss5):
-                print("Warning: loss5 is NaN, resetting to zero")
+            # # 当前批次计算
+            #被注释的函数在reaward
+            # reject_loss, batch_reject_losses, batch_y_logits = compute_rejection_prob_loss_weight_generate(
+            #     y_logits_,
+            #     proxy_tokenizer,
+            #     target_model,
+            #     target_tokenizer,
+            #     target_model.device,
+            #     reject_token_ids
+            # )
+            #batch_y_logits的维度为3才对
+            # if batch_y_logits.dim() == 2:
+            #     batch_y_logits = batch_y_logits.unsqueeze(-1).expand(-1, -1, proxy_model.config.vocab_size)
+            # # 确保 batch_y_logits 是 tensor
+            #
+            # if isinstance(batch_y_logits, list):
+            #     batch_y_logits = torch.stack(batch_y_logits)
+
+            # batch_reject_losses_tensor = torch.tensor(batch_reject_losses, device=seq_logps.device)
+            #
+            # # 当前批次
+            # N = args.batch_size
+            # _, batch_indices = torch.topk(batch_reject_losses_tensor, k=N, largest=False)
+            # selected_y_logits = y_logits_[batch_indices]
+            # selected_reject_losses = batch_reject_losses_tensor[batch_indices]
+            #
+            #
+            # # 把当前批次的加入全局 tensor
+            # if global_y_logits is None:
+            #     global_y_logits = selected_y_logits  # [N, seq_len, vocab_size]
+            #     global_reject_losses = selected_reject_losses  # [N]
+            # else:
+            #     global_y_logits = torch.cat([global_y_logits, selected_y_logits], dim=0)
+            #     global_reject_losses = torch.cat([global_reject_losses, selected_reject_losses], dim=0)
+
+            # 从全局里选出最小 N 个
+            # _, global_indices = torch.topk(global_reject_losses, k=N, largest=False)
+            # global_y_logits = global_y_logits[global_indices]
+            # global_reject_losses = global_reject_losses[global_indices]
+            # weights = -global_reject_losses
+            # temperature = 1.0
+            # probs = torch.softmax(weights / temperature, dim=0)
+            # indices = torch.multinomial(probs, num_samples=N, replacement=False)
+            # global_y_logits = global_y_logits[indices]
+            # global_reject_losses = global_reject_losses[indices]
+            #
+            # # 用全局最小的平均值计算 hes_loss
+            # threshold = 0.015
+            # # 只对超出阈值的部分计算 loss，没超的不惩罚
+            # excess = torch.relu(global_reject_losses - threshold)  # 超出多少就惩罚多少
+            # hes_loss = hesitation_loss_continuous(excess.mean(), target=threshold)
+            hes_weight = 1
+            loss5 = hes_weight * hes_loss
+
+        else:
+            text, _, last_text_ids = decode_with_model_topk(
+                proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
+                bad_mask=None)
+
+            keywords = lowercase_words
+            _, _, text = find_most_matches(text, keywords)
+
+            prompt = x + " " + text
+
+            loss, predicted_tokens = compute_fine_grained_loss(
+                model_name=args.pretrained_model,
+                base_prompt=prompt,
+                target=k,
+                api=target_model_path,
+                temperature=0.7
+            )
+            if isinstance(loss, float):
+                if math.isnan(loss):
+                    loss = 0.0
+                if math.isinf(loss):
+                    loss = 0.0
+                loss = torch.tensor(loss, requires_grad=True, device=device)
+
+            print("loss", loss)
+            loss = 100 - loss
+            hes_loss = loss * 0.01 * 1 / 5
+
+            hes_weight = 5000
+            loss5 = hes_weight * hes_loss
+
+        if torch.isnan(loss5):
+            print("Warning: loss5 is NaN, resetting to zero")
 
 
 
@@ -918,11 +918,11 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             print("Warning: flu_loss is NaN, resetting to zero")
         if torch.isnan(bleu_loss).any():
             print("Warning: bleu_loss is NaN, resetting to zero")
-        if ite >= 1000:
+        # if ite >= 1000:
         # 替换你的损失计算部分（训练循环中）
-            loss_total = loss_balancer(loss1, loss2,loss3,loss4, loss5,current_step=ite)
-        else:
-            loss_total = loss_balancer(loss1, loss2, loss3, loss4,None,current_step=ite)
+        loss_total = loss_balancer(loss1, loss2,loss3,loss4, loss5,current_step=ite)
+        # else:
+        #     loss_total = loss_balancer(loss1, loss2, loss3, loss4,None,current_step=ite)
 
         # loss_total = loss1 + loss2  + loss4 +loss5 #+ loss3  #+ loss5 #+ loss5
 
@@ -966,30 +966,33 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
             if not  args.useapi:
                 for bi in range(args.batch_size):
                     prompt = x + " " + text_post[bi]
-                    print("[攻击中]:" )
-                    print("[提示词输入]: %s" % prompt)
+                    logger.info("[攻击中]:" )
+                    logger.info("[提示词输入]: %s" % prompt)
                     # input_ids = proxy_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
                     input_ids = target_tokenizer(prompt, return_tensors="pt").input_ids.to(target_model.device)
                     logger.info("\n Output of the model:\n")
                     output_ids = target_model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
                                                 top_k=args.topk)
-                    # logger.info("[output]: %s" % (proxy_tokenizer.decode(output_ids[0], skip_special_tokens=True)))
-                    print("[目标模型输出]: %s" % (target_tokenizer.decode(output_ids[0], skip_special_tokens=True)) )
+                    #结果
+                    output=proxy_tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                    logger.info("[output]: %s" % output)
+
+                    # print("[目标模型输出]: %s" % (target_tokenizer.decode(output_ids[0], skip_special_tokens=True)) )
             else:
                 prompts = []
                 for bi in range(args.batch_size):
                     prompt = x + " " + text_post[bi]
-                    print(f"\n=== 准备批量 API 调用, 样本: {bi} ===")
-                    print(f"原始 prompt 内容: {prompt[:100]}...")
+                    logger.info(f"\n=== 准备批量 API 调用, 样本: {bi} ===")
+                    logger.info(f"原始 prompt 内容: {prompt[:100]}...")
                     prompt = prompt.replace("</s>", " ").strip()
                     if not prompt or prompt.isspace():
-                        print("警告: 检测到空 prompt, 跳过生成")
+                        logger.info("警告: 检测到空 prompt, 跳过生成")
                         prompts.append("")  # 空 prompt 占位符
                     else:
                         prompts.append(prompt)
                 api_texts = call_api_completion(args.pretrained_model, args.api, prompts, max_tokens=512,
                                                 temperature=0.7)
-                print(f"成功通过 API 批量生成文本, 生成结果数: {len(api_texts)}")
+                logger.info(f"成功通过 API 批量生成文本, 生成结果数: {len(api_texts)}")
                 # print("api输出：",api_texts)
 
 
@@ -1031,7 +1034,7 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                     'grad/max': epsilon.grad.max().item(),
                     'grad/min': epsilon.grad.min().item()
                 }, step=wandb_step)
-            if ite>=1000 :
+            # if ite>=1000 :
                 wandb.log({
                      'loss/hes': hes_weight * hes_loss.mean().item()
                 }, step=wandb_step)
@@ -1068,36 +1071,36 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                     y_logits = y_logits + noise
     #打印历史最佳
     text, _, last_text_ids = decode_with_model_topk(
-        proxy_model, global_y_logits, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
+        proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
         bad_mask=None)
-    text_post = text
-    if not args.useapi:
-        for bi in range(args.batch_size):
-            prompt = x + " " + text_post[bi]
-            print("[攻击中]:")
-            print("[提示词输入]: %s" % prompt)
-            # input_ids = proxy_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-            input_ids = target_tokenizer(prompt, return_tensors="pt").input_ids.to(target_model.device)
-            logger.info("\n Output of the model:\n")
-            output_ids = target_model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
-                                               top_k=args.topk)
-            # logger.info("[output]: %s" % (proxy_tokenizer.decode(output_ids[0], skip_special_tokens=True)))
-            print("[目标模型输出]: %s" % (target_tokenizer.decode(output_ids[0], skip_special_tokens=True)))
-    else:
-        prompts = []
-        for bi in range(args.batch_size):
-            prompt = x + " " + text_post[bi]
-            print(f"\n=== 准备批量 API 调用, 样本: {bi} ===")
-            print(f"原始 prompt 内容: {prompt[:100]}...")
-            prompt = prompt.replace("</s>", " ").strip()
-            if not prompt or prompt.isspace():
-                print("警告: 检测到空 prompt, 跳过生成")
-                prompts.append("")  # 空 prompt 占位符
-            else:
-                prompts.append(prompt)
-        api_texts = call_api_completion(args.pretrained_model, args.api, prompts, max_tokens=512,
-                                        temperature=0.7)
-        print(f"成功通过 API 批量生成文本, 生成结果数: {len(api_texts)}")
+    # text_post = text
+    # if not args.useapi:
+    #     for bi in range(args.batch_size):
+    #         prompt = x + " " + text_post[bi]
+    #         print("[攻击中]:")
+    #         print("[提示词输入]: %s" % prompt)
+    #         # input_ids = proxy_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    #         input_ids = target_tokenizer(prompt, return_tensors="pt").input_ids.to(target_model.device)
+    #         logger.info("\n Output of the model:\n")
+    #         output_ids = target_model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
+    #                                            top_k=args.topk)
+    #         # logger.info("[output]: %s" % (proxy_tokenizer.decode(output_ids[0], skip_special_tokens=True)))
+    #         print("[目标模型输出]: %s" % (target_tokenizer.decode(output_ids[0], skip_special_tokens=True)))
+    # else:
+    #     prompts = []
+    #     for bi in range(args.batch_size):
+    #         prompt = x + " " + text_post[bi]
+    #         print(f"\n=== 准备批量 API 调用, 样本: {bi} ===")
+    #         print(f"原始 prompt 内容: {prompt[:100]}...")
+    #         prompt = prompt.replace("</s>", " ").strip()
+    #         if not prompt or prompt.isspace():
+    #             print("警告: 检测到空 prompt, 跳过生成")
+    #             prompts.append("")  # 空 prompt 占位符
+    #         else:
+    #             prompts.append(prompt)
+    #     api_texts = call_api_completion(args.pretrained_model, args.api, prompts, max_tokens=512,
+    #                                     temperature=0.7)
+    #     print(f"成功通过 API 批量生成文本, 生成结果数: {len(api_texts)}")
         # print("api输出：",api_texts)
     #此地方使用历史最佳
     # text, _, last_text_ids = decode_with_model_topk(proxy_model, global_y_logits , args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None, bad_mask=None)
