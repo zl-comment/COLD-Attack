@@ -277,16 +277,14 @@ def filter_logits_for_target_model(logits, target_vocab_size, target_vocab):
     return mapped_logits.long()
 
 
-def decode(target_model_path, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
+def decode(target_model_path,target_model, target_tokenizer, proxy_model, proxy_tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
            model_back=None, zz=None):
 
 
     torch.cuda.empty_cache()
 
 
-    # 加载代理模型
-    proxy_model, proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device,args=args)
-    text, _, last_text_ids = decode_proxy_little(target_model_path, proxy_model, proxy_tokenizer, device, x, z,
+    text, _, last_text_ids ,decoded_text= decode_proxy_little(target_model_path,target_model, target_tokenizer, proxy_model, proxy_tokenizer, device, x, z,
                                                  constraints, args, sys_prompt, prefix, model_back, zz)
 
     # 清理代理模型 GPU 内存
@@ -329,79 +327,24 @@ def decode(target_model_path, device, x="", z="", constraints=None, args=None, s
 
     else:
         # 非 API 模式，加载本地目标模型和分词器
-        model, tokenizer = load_model_and_tokenizer(target_model_path,
-                                                    low_cpu_mem_usage=True,
-                                                    use_cache=False,
-                                                    device=device)
-        model.eval()
-        last_text_ids = filter_logits_for_target_model(last_text_ids, tokenizer.vocab_size, tokenizer.get_vocab())
-        print("text:", text)
-
-        decoded_text = []
-        # 对每个 batch 样本生成完整文本
-        for bi in range(args.batch_size):
-            print(f"\n=== 本地生成过程, 批次: {bi} ===")
-            prompt = x + " " + text_post[bi]
-            print(f"原始 prompt 内容: {prompt[:100]}...")
-            if not prompt or prompt.isspace():
-                print("警告: 检测到空 prompt, 跳过生成")
-                decoded_text.append("")
-                continue
-            prompt = prompt.replace("</s>", " ").strip()
-            input_data = tokenizer(prompt,
-                                   return_tensors="pt",
-                                   padding=True,
-                                   truncation=True,
-                                   max_length=512,
-                                   return_attention_mask=True)
-            input_ids = input_data["input_ids"].to(device)
-            attention_mask = input_data["attention_mask"].to(device)
-            print(f"tokenization 后的 input_ids 形状: {input_ids.shape}")
-            print(f"前10个 token: {input_ids[0, :10].tolist()}")
-            if input_ids.numel() == 0 or torch.all(input_ids == 0):
-                print("警告: 检测到无效的 input_ids, 跳过生成")
-                decoded_text.append("")
-                continue
-            try:
-                output_ids = model.generate(
-                    input_ids=input_ids,
-                    temperature=0.7,
-                    max_length=512,
-                    attention_mask=attention_mask,
-                    pad_token_id=tokenizer.pad_token_id,
-                    do_sample=True,
-                    top_k=args.topk
-                )
-                # 去除 prompt 部分
-                output_ids = output_ids[:, input_ids.shape[1]:]
-                text_dec = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-                decoded_text.append(text_dec.strip())
-                print(f"成功生成文本, 长度: {len(text_dec)}")
-            except RuntimeError as e:
-                print(f"生成过程中的 CUDA 错误: {str(e)}")
-                decoded_text.append("")
-            except Exception as e:
-                print(f"生成过程中的其他错误: {str(e)}")
-                decoded_text.append("")
 
         print("\n=== 本地生成过程完成 ===")
         print(f"成功生成的文本数量: {len([t for t in decoded_text if t])}/{args.batch_size}")
 
         # 计算 perplexity（使用本地目标模型计算困惑度）
-        last_rank_loss = model(input_ids=last_text_ids, labels=last_text_ids).loss
+        last_text_ids = last_text_ids.to(target_model.device)
+        last_rank_loss = target_model(input_ids=last_text_ids, labels=last_text_ids).loss
         last_rank_loss = last_rank_loss.detach().clone().data.cpu().numpy()
         ppl_last = np.exp(last_rank_loss)  # 代表一个批次的平均困惑度
         ppl = [ppl_last for _ in range(args.batch_size)]
         prompt_with_adv = [x + " " + t for t in text_post]
 
-        # 清理目标模型 GPU 内存
-        del model, tokenizer
-        torch.cuda.empty_cache()
+
 
         return ppl, text, text_post, decoded_text, prompt_with_adv
 
 
-def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
+def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_model, proxy_tokenizer, device, x="", z="", constraints=None, args=None, sys_prompt=None, prefix=None,
                           model_back=None, zz=None):
     """
     x: left context (prompt in lexical task)
@@ -413,13 +356,6 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
     print("[启动]")
     proxy_model.eval()  # 设置评估模式
     logger = setup_logger(args)
-    if not args.useapi:
-        # 加载目标模型和分词器（目标模型在 cuda:1 上）
-        target_model, target_tokenizer  =  load_model_and_tokenizer(target_model_path,low_cpu_mem_usage=True,use_cache=False,device='cuda:1')
-    else:
-        print("using api",target_model_path) #target_model_path就是api
-
-
 
 
     # 不良词汇
@@ -981,13 +917,22 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                                                 top_k=args.topk)
                     #结果
                     output=proxy_tokenizer.decode(output_ids[0], skip_special_tokens=True)
-                    if not has_meaningless_patterns(output):
+                    # 对 output 做安全打分
+                    if has_meaningless_patterns(output):
+                        # 如果是“无意义”模式，直接给 0.0 分
+                        prob = 0.0
+                        raw = None
+                    else:
+                        # 正常情况下调用接口打分
                         prob, raw = query_guard_vllm(output)
-                        logger.info("[output] : %s" % output)
-                        logger.info("[UNSAFE]: %s" % prob)
-                        all_prompts.append(prompt)
-                        all_outputs.append(output)
-                        all_scores.append(prob)
+
+                    # 统一记录日志和收集结果
+                    logger.info("[output]   : %s", output)
+                    logger.info("[UNSAFE]    : %s", prob)
+                    all_prompts.append(prompt)
+                    all_outputs.append(output)
+                    all_scores.append(prob)
+
                 if not all_scores:
                     logger.warning(f"[iter {ite}] 本轮没找到合格候选，跳过")
                     continue
@@ -1012,10 +957,6 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
 
                     break
 
-
-
-
-
             else:
                 prompts = []
                 for bi in range(args.batch_size):
@@ -1038,20 +979,11 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
         if args.wandb:
             wandb_step = ite + 1
             wandb.log({
-                # 'p_reject/mean': reject_loss.mean().item(),
-                # 'p_reject/max': reject_loss.max().item(),
-                # 'p_reject/min': reject_loss.min().item(),
                 'loss/total': loss.item(),
                 'loss/fluency': flu_weight * flu_loss.mean().item(),
                 'loss/target': goal_weight *  c_loss_1.mean().item(),
-                # 'loss/ent': ent_weight * ent_loss.mean().item(),
-                # 'loss/cw': cw_loss.mean().item(),
                 'loss/bleu': rej_weight * bleu_loss.mean().item(),
-                # 'loss/reject': 100 * reject_loss.mean().item(),
-                # 'loss/l2_reg': torch.norm(epsilon).item() * 0.01,
                 'loss/kl_sm': kl_loss_weight * sem_loss.mean().item(),
-                # 'loss/unsafe': unsafe_weight * unsafe_loss.mean().item(),
-                # 'loss/ Critic': Re_weight * ret_struct .loss.mean().item(),
                 'progress': progress,
                 'weights/goal': goal_weight,
                 'weights/fluency': flu_weight,
@@ -1062,7 +994,6 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 'val/min_epsilon': epsilon.abs().min().item(),
                 'norm/epsilon': torch.norm(epsilon).item(),
                 'norm/y_logits': torch.norm(y_logits).item(),
-                # 'norm/soft_forward_y': torch.norm(soft_forward_y).item(),
                 'norm/y_logits_t': torch.norm(y_logits_t).item(),
                 'learning_rate': scheduler.get_last_lr()[0]
             }, step=wandb_step)
@@ -1078,30 +1009,31 @@ def decode_proxy_little(target_model_path,proxy_model, proxy_tokenizer, device, 
                 }, step=wandb_step)
 
 
-        # if ite < args.num_iters - 1:
-        #     large_noise_iters = [int(_) for _ in args.large_noise_iters.split(',')]
-        #     large_gs_stds = [float(_) for _ in args.large_gs_std.split(',')]
-        #     noise_std = args.gs_std * 0.7
-        #     if ite % args.noise_iters == 0:
-        #         noise_last = True
-        #         for ni in range(len(large_noise_iters)):
-        #             if ite < large_noise_iters[ni]:
-        #                 noise_last = False
-        #                 break
-        #         if noise_last:
-        #             noise_std = args.gs_std
-        #         else:
-        #             noise_std = large_gs_stds[ni]
-        #         noise = torch.normal(mean=args.gs_mean, std=noise_std, size=epsilon.size(),
-        #                              device='cuda', requires_grad=False)
-        #         if 0 <= args.win_anneal_iters <= ite:
-        #             zeros = torch.zeros_like(noise)
-        #             noise_mix = torch.cat([zeros[:, :frozen_len], noise[:, frozen_len:]], dim=1)
-        #             y_logits = y_logits + noise_mix
-        #         else:
-        #             y_logits = y_logits + noise
+        if ite < args.num_iters - 1:
+            large_noise_iters = [int(_) for _ in args.large_noise_iters.split(',')]
+            large_gs_stds = [float(_) for _ in args.large_gs_std.split(',')]
+            noise_std = args.gs_std * 0.7
+            if ite % args.noise_iters == 0:
+                noise_last = True
+                for ni in range(len(large_noise_iters)):
+                    if ite < large_noise_iters[ni]:
+                        noise_last = False
+                        break
+                if noise_last:
+                    noise_std = args.gs_std
+                else:
+                    noise_std = large_gs_stds[ni]
+                noise = torch.normal(mean=args.gs_mean, std=noise_std, size=epsilon.size(),
+                                     device='cuda', requires_grad=False)
+                if 0 <= args.win_anneal_iters <= ite:
+                    zeros = torch.zeros_like(noise)
+                    noise_mix = torch.cat([zeros[:, :frozen_len], noise[:, frozen_len:]], dim=1)
+                    y_logits = y_logits + noise_mix
+                else:
+                    y_logits = y_logits + noise
     #打印
     text, _, last_text_ids = decode_with_model_topk(
         proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
         bad_mask=None)
-    return text, _, last_text_ids
+
+    return text, _, last_text_ids,all_outputs
