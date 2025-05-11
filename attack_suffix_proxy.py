@@ -51,9 +51,10 @@ def attack_generation(target_model_path, device, args, model_back=None, ppl_last
     # 加载代理模型
     proxy_model, proxy_tokenizer = load_proxy_model(args.proxy_model_path, device=device, args=args)
     if not args.useapi:
+        n_gpu = torch.cuda.device_count()
         # 加载目标模型和分词器（目标模型在 cuda:1 上）
         target_model, target_tokenizer = load_model_and_tokenizer(target_model_path, low_cpu_mem_usage=True,
-                                                                  use_cache=False, device='cuda:1')
+                                                                  use_cache=False, device=torch.device("cuda:1" if n_gpu >= 2 else "cuda:0"))
     else:
         print("using api", target_model_path)  # target_model_path就是api
         target_model, target_tokenizer = None, None

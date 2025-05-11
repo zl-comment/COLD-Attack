@@ -496,7 +496,14 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
     if args.wandb:
         import wandb, time
         run_name = f"{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}_{int(round(time.time() * 1000))}"
-        wandb.init(project=args.wandb_project, name=run_name, config=args, reinit=True)
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config=args,
+            dir="/share/sda2/ZL/wandb",  # ← 指定你想要的目录
+            reinit=True
+        )
+
     y_logits = init_logits
     # 初始化（放在模型定义部分）
     # loss_balancer = UncertaintyWeighting().to(device)
