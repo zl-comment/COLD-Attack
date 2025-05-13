@@ -927,7 +927,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     output_ids = target_model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
                                                 top_k=args.topk,attention_mask =attention_mask )
                     #结果
-                    output=target_model.decode(output_ids[0], skip_special_tokens=True)
+                    output=target_tokenizer.decode(output_ids[0], skip_special_tokens=True)
                     # 对 output 做安全打分
                     if has_meaningless_patterns(output):
                         # 如果是“无意义”模式，直接给 0.0 分
