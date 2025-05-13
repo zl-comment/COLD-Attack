@@ -918,12 +918,16 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     logger.info("[攻击中]:" )
                     logger.info("[提示词输入]: %s" % prompt)
                     # input_ids = proxy_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-                    input_ids = target_tokenizer(prompt, return_tensors="pt").input_ids.to(target_model.device)
+                    inputs = target_tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+
+                    # 从返回的字典中获取 input_ids 和 attention_mask
+                    input_ids = inputs['input_ids'].to(target_model.device)
+                    attention_mask = inputs['attention_mask'].to(target_model.device)
                     logger.info("\n Output of the model:\n")
                     output_ids = target_model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
-                                                top_k=args.topk)
+                                                top_k=args.topk,attention_mask =attention_mask )
                     #结果
-                    output=proxy_tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                    output=target_model.decode(output_ids[0], skip_special_tokens=True)
                     # 对 output 做安全打分
                     if has_meaningless_patterns(output):
                         # 如果是“无意义”模式，直接给 0.0 分
