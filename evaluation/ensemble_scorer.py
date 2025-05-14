@@ -13,6 +13,7 @@ from evaluation.bert_score.bert_score import BertScore
 from evaluation.bleu.bleu import Bleu
 from evaluation.cider.cider import Cider
 from evaluation.rouge.rouge import Rouge
+from evaluation.DNS.DNScore import DNScore
 from evaluation.meteor.meteor import Meteor
 from collections import defaultdict
 ROUGE_KEYS = ["rouge1", "rouge2", "rougeL"]
@@ -26,32 +27,16 @@ class Scorer:
             # (Meteor(),"METEOR"),
             (Rouge(), "ROUGE_L"),
             (Cider(), "CIDEr"),
-            (BertScore(), "Bert Score")
+            (BertScore(), "Bert Score"),
+            (DNScore(), "DNS")
         ]
 
-    def compute_dns(self):
-        # 将所有句子合并为一个列表，计算语料库级别的 Distinct-1 和 Distinct-2 分数
-        all_sentences = []
-        for key, gt_sentences in self.gt.items():
-            all_sentences.extend(gt_sentences)  # 合并所有句子
-
-        # 计算整个语料库的 Distinct-1 和 Distinct-2 分数
-        distinct_corpus_1 = distinct_n_corpus_level(all_sentences, 1)
-        distinct_corpus_2 = distinct_n_corpus_level(all_sentences, 2)
-
-        # 返回计算的 DNS 分数
-        return {"DNS_1": distinct_corpus_1, "DNS_2": distinct_corpus_2}
 
     def compute_scores(self):
-        # Compute DNS directly using compute_dns method
-        dns_scores = self.compute_dns()
+
 
         # Create a dictionary for storing all scores
         total_scores = {}
-
-        # First handle DNS separately
-        for key, value in dns_scores.items():
-            total_scores[f"DNS_{key}"] = value
 
         # Now handle other scorers
         for scorer, method in self.scorers:
