@@ -28,7 +28,7 @@ class Scorer:
             (Rouge(), "ROUGE_L"),
             (Cider(), "CIDEr"),
             (BertScore(), "Bert Score"),
-            (DNScore(), "DNS")
+            (DNScore(), ["DNS_1", "DNS_2"])
         ]
 
 

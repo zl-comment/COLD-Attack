@@ -17,7 +17,7 @@ class DNScore:
         distinct_corpus_2 = distinct_n_corpus_level(all_sentences, 2)
 
         # 返回计算的 DNS 分数
-        return distinct_corpus_1 ,distinct_corpus_2
+        return (distinct_corpus_1, distinct_corpus_2), None
 
 
     def method(self):
