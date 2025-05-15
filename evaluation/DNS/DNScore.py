@@ -7,7 +7,7 @@ class DNScore:
         self.ref_for_image = {}
 
     def compute_score(self, gts, res):
-        # 将所有句子合并为一个列表，计算语料库级别的 Distinct-1 和 Distinct-2 分数
+        # 将所有句子合并为一个列表，计算语料库级别的 Distinct-1 和 Distinct-2 Distinct-3 Distinct-4 分数
         all_sentences = []
         for key, gt_sentences in gts.items():
             all_sentences.extend(gt_sentences)  # 合并所有句子
@@ -15,9 +15,12 @@ class DNScore:
         # 计算整个语料库的 Distinct-1 和 Distinct-2 分数
         distinct_corpus_1 = distinct_n_corpus_level(all_sentences, 1)
         distinct_corpus_2 = distinct_n_corpus_level(all_sentences, 2)
+        distinct_corpus_3 = distinct_n_corpus_level(all_sentences, 3)
+        distinct_corpus_4 = distinct_n_corpus_level(all_sentences, 4)
+        ADN=(distinct_corpus_1+distinct_corpus_2+distinct_corpus_3+distinct_corpus_4)/4
 
         # 返回计算的 DNS 分数
-        return (distinct_corpus_1, distinct_corpus_2), None
+        return (distinct_corpus_1, distinct_corpus_2,distinct_corpus_3,distinct_corpus_4,ADN), None
 
 
     def method(self):
