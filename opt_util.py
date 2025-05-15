@@ -45,6 +45,7 @@ def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', *
         tokenizer.padding_side = 'left'
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
 
 
     return model, tokenizer
