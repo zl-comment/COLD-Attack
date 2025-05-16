@@ -22,6 +22,8 @@ def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', *
         use_cache=True,
     )
 
+    if 'vicuna-7b-v1.5' in tokenizer_path:
+        tokenizer.padding_side = 'left'
     if 'Mistral-7B-Instruct-v0.2' in tokenizer_path:
 
         # 设置 bos_token_id，unk_token_id，eos_token_id 和 pad_token_id
