@@ -685,57 +685,6 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                 hes_loss = policy_loss + C  # 现在 loss5 ≥ 0，且保留了 policy_loss 之间的差距
 
 
-                # # 当前批次计算
-                #被注释的函数在reaward
-                # reject_loss, batch_reject_losses, batch_y_logits = compute_rejection_prob_loss_weight_generate(
-                #     y_logits_,
-                #     proxy_tokenizer,
-                #     target_model,
-                #     target_tokenizer,
-                #     target_model.device,
-                #     reject_token_ids
-                # )
-                #batch_y_logits的维度为3才对
-                # if batch_y_logits.dim() == 2:
-                #     batch_y_logits = batch_y_logits.unsqueeze(-1).expand(-1, -1, proxy_model.config.vocab_size)
-                # # 确保 batch_y_logits 是 tensor
-                #
-                # if isinstance(batch_y_logits, list):
-                #     batch_y_logits = torch.stack(batch_y_logits)
-
-                # batch_reject_losses_tensor = torch.tensor(batch_reject_losses, device=seq_logps.device)
-                #
-                # # 当前批次
-                # N = args.batch_size
-                # _, batch_indices = torch.topk(batch_reject_losses_tensor, k=N, largest=False)
-                # selected_y_logits = y_logits_[batch_indices]
-                # selected_reject_losses = batch_reject_losses_tensor[batch_indices]
-                #
-                #
-                # # 把当前批次的加入全局 tensor
-                # if global_y_logits is None:
-                #     global_y_logits = selected_y_logits  # [N, seq_len, vocab_size]
-                #     global_reject_losses = selected_reject_losses  # [N]
-                # else:
-                #     global_y_logits = torch.cat([global_y_logits, selected_y_logits], dim=0)
-                #     global_reject_losses = torch.cat([global_reject_losses, selected_reject_losses], dim=0)
-
-                # 从全局里选出最小 N 个
-                # _, global_indices = torch.topk(global_reject_losses, k=N, largest=False)
-                # global_y_logits = global_y_logits[global_indices]
-                # global_reject_losses = global_reject_losses[global_indices]
-                # weights = -global_reject_losses
-                # temperature = 1.0
-                # probs = torch.softmax(weights / temperature, dim=0)
-                # indices = torch.multinomial(probs, num_samples=N, replacement=False)
-                # global_y_logits = global_y_logits[indices]
-                # global_reject_losses = global_reject_losses[indices]
-                #
-                # # 用全局最小的平均值计算 hes_loss
-                # threshold = 0.015
-                # # 只对超出阈值的部分计算 loss，没超的不惩罚
-                # excess = torch.relu(global_reject_losses - threshold)  # 超出多少就惩罚多少
-                # hes_loss = hesitation_loss_continuous(excess.mean(), target=threshold)
                 hes_weight = 1
                 loss5 = hes_weight * hes_loss
 
