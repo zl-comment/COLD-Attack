@@ -16,6 +16,9 @@ from evaluation.rouge.rouge import Rouge
 from evaluation.DNS.DNScore import DNScore
 from evaluation.meteor.meteor import Meteor
 from collections import defaultdict
+
+from evaluation.self_bleu.SelfBleuScore import SelfBleuScore
+
 ROUGE_KEYS = ["rouge1", "rouge2", "rougeL"]
 class Scorer:
     def __init__(self, ref, gt):
@@ -28,7 +31,8 @@ class Scorer:
             (Rouge(), "ROUGE_L"),
             (Cider(), "CIDEr"),
             (BertScore(), "Bert Score"),
-            (DNScore(), ["DNS_1", "DNS_2","DNS_3","DNS_4","ADN"])
+            (DNScore(), ["DNS_1", "DNS_2","DNS_3","DNS_4","ADN"]),
+            (SelfBleuScore(),"Self-BLEU")
         ]
 
 
