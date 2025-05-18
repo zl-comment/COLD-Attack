@@ -5,6 +5,7 @@ from torch import amp
 import re
 from typing import List
 import math
+import requests
 from typing import Tuple
 
 VLLM_COMPLETION_URL = "http://172.20.0.251:8000/v1/completions"
