@@ -42,7 +42,7 @@ def options():
     parser.add_argument("--end", type=int, default=10, help="loading data util ith examples.")
     parser.add_argument("--repeat-batch", type=int, default=1, help="loading data util ith examples.")
     parser.add_argument("--mode", type=str, default='constrained_langevin',
-                        choices=['suffix', 'control', 'paraphrase','proxy','proxy_one'])
+                        choices=['suffix', 'control', 'paraphrase','proxy','proxy_one','control_proxy'])
     parser.add_argument("--control-type", type=str, default='sentiment', choices=['sentiment', 'lexical', 'style', 'format'])
     ## model
     parser.add_argument("--batch-size", type=int, default=1)
@@ -169,9 +169,15 @@ def main():
     if "suffix" in args.mode:
         from attack_suffix import attack_generation
         attack_generation(model, tokenizer, device, args)
+
     elif "paraphrase" in args.mode:
         from attack_paraphrase import attack_generation
         attack_generation(model, tokenizer, device, args)
+
+    elif "control_proxy" in args.mode:
+        from attack_control_proxy import attack_generation  ##再添加一个代理模型
+        attack_generation(model_path, device, args)
+
     elif "control" in args.mode:
         from attack_control import attack_generation
         attack_generation(model, tokenizer, device, args)
@@ -181,6 +187,7 @@ def main():
     elif "proxy" in args.mode:
         from attack_suffix_proxy import attack_generation   ##再添加一个代理模型
         attack_generation(model_path, device, args)
+
 
 
 if __name__ == "__main__":
