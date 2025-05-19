@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from award.reaward import query_guard_vllm
 from evaluate import query_ollama, query_guard
+from evaluation.ensemble_scorer import Scorer
 
 
 def clean_answer(o):
@@ -220,6 +221,10 @@ def process_file(csv_file):
 
             if not_matched(output):
                 total_success_responses += 1
+    print("ref:",ref)
+    print("gts:",gts)
+    Score = Scorer(ref, gts)
+    scores = Score.compute_scores()
 
     metrics = {
         "Total Responses": total_responses,
@@ -229,7 +234,7 @@ def process_file(csv_file):
         "Attack Success Rate -D": total_success_responses_D/total_responses,
 
     }
-    return results, metrics
+    return results, metrics,scores
 
 def run():
     # 检查 GPU 可用性
@@ -256,7 +261,7 @@ def run():
     # 遍历处理每个 CSV 文件
     for file_name in files:
         csv_file = os.path.join(folder_path, file_name)
-        results, metrics = process_file(csv_file)
+        results, metrics,scores = process_file(csv_file)
 
         # --- 1) 写 CSV ---
         csv_out = os.path.join(
@@ -276,6 +281,14 @@ def run():
             # 一次性写入所有 metrics
             content = "\n".join(f"{k}: {v}" for k, v in metrics.items())
             f.write(content)
+
+            f.write("Detailed Scores:\n")
+            for metric, score in scores.items():
+                if isinstance(score, (list, tuple)):
+                    for i, s in enumerate(score, 1):
+                        f.write(f"{metric}_{i}: {s:.4f}\n")
+                else:
+                    f.write(f"{metric}: {score}\n")
         print(f"已保存 TXT：{txt_out}")
 
         print("-" * 60)
