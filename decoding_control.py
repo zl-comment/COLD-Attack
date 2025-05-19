@@ -211,7 +211,7 @@ def decode(model, tokenizer, device, x="", z="", key_word="", constraints=None, 
 
     mask_t = None
 
-    for iter in range(args.num_iters):
+    for iter in tqdm(range(args.num_iters), desc="Optimizing"):
         optim.zero_grad()
 
         y_logits_ = y_logits + epsilon
