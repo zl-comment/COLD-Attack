@@ -1,7 +1,5 @@
 import pandas as pd
-import os
-
-from nltk.corpus import stopwords
+import os.path as osp
 
 from util import *
 
@@ -12,8 +10,8 @@ stop_words = set(stopwords.words('english'))
 from decoding_control import decode
 
 def attack_generation(model, tokenizer, device, args, model_back=None):
-    
-    data = pd.read_csv("./data/advbench/harmful_behaviors_custom_keywords.csv")
+    data = pd.read_csv(args.data_path)
+    file_name = osp.basename(args.data_path).replace('.csv', '')
 
     targets = data['target'].tolist()
     goals = data['goal'].tolist()
@@ -74,4 +72,12 @@ def attack_generation(model, tokenizer, device, args, model_back=None):
             results["prompt"] = [line.strip() for line in prompts]  
             results["prompt_with_adv"] = prompts_with_adv           
             results["output"] = outputs                       
-            results["adv"] = text_complete_candidates                              
+            results["adv"] = text_complete_candidates
+
+        print(results)
+
+
+        if osp.exists(f"outputs/{file_name}/{args.pretrained_model}/{args.start}_{args.end}.csv"):
+            results.to_csv(f"outputs/{file_name}/{args.pretrained_model}/{args.start}_{args.end}.csv", mode='w', header=False)
+        else:
+            results.to_csv(f"outputs/{file_name}/{args.pretrained_model}/{args.start}_{args.end}.csv", mode='w')
