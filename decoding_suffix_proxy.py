@@ -824,6 +824,11 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
         # loss = loss / accumulation_steps
         # print("loss", loss)
         # 如果不是最后一次迭代，进行反向传播和优化
+
+        if ite >= 1000:
+            print(f"loss5.requires_grad: {loss5.requires_grad}")
+        print(f"loss.requires_grad: {loss.requires_grad}")
+        print(f"loss.grad_fn: {loss.grad_fn}")
         if ite < args.num_iters - 1:
             try:
                 torch.cuda.empty_cache()  # 清理之前的缓存
@@ -839,15 +844,15 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
 
 
 
-
             optim.step()
             with torch.no_grad():
                 # element‐wise clamp，把每个分量限制到 [–10000,10000]
-                epsilon.clamp_(-10000.0, 10000.0)
-                epsilon = torch.nan_to_num(epsilon,  # 把 NaN/±inf 一并替换
-                                           nan=0.0,
-                                           posinf=10000.0,
-                                           neginf=-10000.0)
+                epsilon.data.clamp_(-10000.0, 10000.0)
+                epsilon.data = torch.nan_to_num(epsilon.data,
+                                                nan=0.0,
+                                                posinf=10000.0,
+                                                neginf=-10000.0)
+
             scheduler.step()
         #关注loss
         pbar.set_postfix(loss=loss.item())
