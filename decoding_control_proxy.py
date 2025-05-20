@@ -371,7 +371,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
 
     y_logits = init_logits
     loss_balancer = UncertaintyWeighting(highlight_idx=2, target_lambda=-2.0, gamma=0.5, switch_step=0).to(device)
-    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits))
+    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32))
     epsilon.requires_grad = True
     if args.prefix_length > 0:
         optim = torch.optim.Adam([list(loss_balancer.parameters()) + [epsilon], prefix_logits], lr=args.stepsize)

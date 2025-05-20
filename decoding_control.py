@@ -185,7 +185,7 @@ def decode(model, tokenizer, device, x="", z="", key_word="", constraints=None, 
 
     y_logits = init_logits
 
-    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits))
+    epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32))
     epsilon.requires_grad = True
     if args.prefix_length > 0:
         optim = torch.optim.Adam([epsilon, prefix_logits], lr=args.stepsize)
@@ -284,6 +284,7 @@ def decode(model, tokenizer, device, x="", z="", key_word="", constraints=None, 
 
         loss = args.goal_weight * c_loss_1 + 1.0 * flu_loss - args.rej_weight * c_loss_3 + 100 * c_loss_2
         loss = loss.mean()
+
         if iter < args.num_iters - 1:  # so that the mask_t at the last iteration will not change
             loss.backward()
             optim.step()
