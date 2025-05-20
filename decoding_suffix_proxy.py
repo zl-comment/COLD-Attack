@@ -825,10 +825,10 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
         # print("loss", loss)
         # 如果不是最后一次迭代，进行反向传播和优化
 
-        if ite >= 1000:
-            print(f"loss5.requires_grad: {loss5.requires_grad}")
-        print(f"loss.requires_grad: {loss.requires_grad}")
-        print(f"loss.grad_fn: {loss.grad_fn}")
+        # if ite >= 1000:
+        #     print(f"loss5.requires_grad: {loss5.requires_grad}")
+        # print(f"loss.requires_grad: {loss.requires_grad}")
+        # print(f"loss.grad_fn: {loss.grad_fn}")
         if ite < args.num_iters - 1:
             try:
                 torch.cuda.empty_cache()  # 清理之前的缓存
