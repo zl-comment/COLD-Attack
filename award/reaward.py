@@ -5,10 +5,11 @@ from torch import amp
 import re
 from typing import List
 import math
-import requests
+import torch
 from typing import Tuple
-
+import numpy as np
 VLLM_COMPLETION_URL = "http://172.20.0.251:8000/v1/completions"
+
 
 def query_guard_vllm(text: str,
                      model: str = "meta-llama-guard-2-8b",
