@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 import time
 
+from pip._internal.cli.cmdoptions import debug_mode
 from scipy.special.cython_special import eval_sh_legendre
 
 import wandb
@@ -31,7 +32,7 @@ from award.reaward import compute_adv_loss_from_safe_baseline_min_gap, build_saf
     compute_rejection_prob_loss_avg_generate_guard, compute_rejection_prob_loss_weight_generate, \
     compute_semantic_reject_loss_steeper, find_most_matches, sample_and_get_logprobs, compute_policy_loss, \
     query_guard_vllm
-from model.Apimodel import compute_fine_grained_loss, call_api_completion
+from model.Apimodel import compute_fine_grained_loss, call_api_completion, compute_fine_grained_batch_reward
 # from model.Apimodel import  call_api_completion
 from model.use_distilled_model import load_model
 from opt_util import load_model_and_tokenizer
@@ -508,7 +509,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
     # 初始化（放在模型定义部分）
     # loss_balancer = UncertaintyWeighting().to(device)
     # 突出第3项(loss3)，让 λ₃ 靠近 -2.0，正则强度 γ=0.5
-    loss_balancer = UncertaintyWeighting(highlight_idx=2, target_lambda=-2.0, gamma=0.5,switch_step = 0).to(device)
+    loss_balancer = UncertaintyWeighting(highlight_idx=1, target_lambda=-1.0, gamma=0.5,switch_step = 0).to(device)
     epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32), requires_grad=True)
     #原来的
     optim = torch.optim.AdamW(
@@ -649,6 +650,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                 N, T, V = y_logits_.shape
                 logps_list = []
                 tokens = []
+                entropies = []
                 for t in range(T):
                     # 每个 step 直接用扰动后 logits 采样
                     step_logits = y_logits_[:, t, :]  # [N, V]
@@ -656,9 +658,10 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     tok = dist.sample()  # [N]
                     logps_list.append(dist.log_prob(tok))
                     tokens.append(tok)
+                    entropies.append(dist.entropy())
                 seq_logps = torch.stack(logps_list, dim=1).sum(dim=1)  # [N]
                 generated_ids = torch.stack(tokens, dim=1)  # [N, T]
-
+                policy_entropy = torch.stack(entropies, dim=1).mean()  # scalar
                 # 3) 黑盒 target_model 评判 → 得到 batch_reject_losses: [N]
                 with torch.no_grad():
                     _, batch_reject_losses, _ = compute_rejection_prob_loss_weight_generate(
@@ -674,14 +677,19 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                                                    device=seq_logps.device)
 
                 # 4) 策略梯度损失（REINFORCE）
+                # rewards = - batch_reject_losses
+                # baseline = rewards.mean().detach()
+                # advantage = rewards - baseline
+                # policy_loss = - (advantage * seq_logps).mean()
+                C=300
                 rewards = - batch_reject_losses
                 baseline = rewards.mean().detach()
-                advantage = rewards - baseline
+                advantage = torch.clamp(rewards - baseline, min=0)  # ✅ 只强化好样本
                 policy_loss = - (advantage * seq_logps).mean()
-                C=300
-                # min_val = policy_loss.min().detach()  # negative or zero
-                # # 只有当 min_val < 0 时才平移，否则不变
-                # shift = torch.clamp(-min_val, min=0)
+
+                policy_loss -= 0.01 * policy_entropy
+
+
                 hes_loss = policy_loss + C  # 现在 loss5 ≥ 0，且保留了 policy_loss 之间的差距
 
 
@@ -689,39 +697,73 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                 loss5 = hes_weight * hes_loss
 
             else:
-                text, _, last_text_ids = decode_with_model_topk(
-                    proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
-                    bad_mask=None)
+                # text, _, last_text_ids = decode_with_model_topk(
+                #     proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
+                #     bad_mask=None)
+                #
+                # keywords = lowercase_words
+                # _, _, text = find_most_matches(text, keywords)
+                #
+                # prompt = x + " " + text
+                #
+                # loss, predicted_tokens = compute_fine_grained_loss(
+                #     model_name=args.pretrained_model,
+                #     base_prompt=prompt,
+                #     target=k,
+                #     api=target_model_path,
+                #     temperature=0.7
+                # )
+                # if isinstance(loss, float):
+                #     if math.isnan(loss):
+                #         loss = 0.0
+                #     if math.isinf(loss):
+                #         loss = 0.0
+                #     loss = torch.tensor(loss, requires_grad=True, device=device)
+                #
+                # print("loss", loss)
+                # loss = 100 - loss
+                # hes_loss = loss * 0.01 * 1 / 5
+                #
+                # hes_weight = 5000
+                # loss5 = hes_weight * hes_loss
+                # ========== [1] 从 y_logits_ 采样
+                from torch.distributions import Categorical
+                logps_list, tokens, entropies = [], [], []
+                for t in range(y_logits_.shape[1]):
+                    step_logits = y_logits_[:, t, :]
+                    dist = Categorical(logits=step_logits)
+                    tok = dist.sample()
+                    logps_list.append(dist.log_prob(tok))
+                    tokens.append(tok)
+                    entropies.append(dist.entropy())
 
-                keywords = lowercase_words
-                _, _, text = find_most_matches(text, keywords)
+                seq_logps = torch.stack(logps_list, dim=1).sum(dim=1)
+                generated_ids = torch.stack(tokens, dim=1)
+                policy_entropy = torch.stack(entropies, dim=1).mean()
 
-                prompt = x + " " + text
+                # ========== [2] 解码
+                texts = proxy_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                prompts = [x + " " + t for t in texts]
 
-                loss, predicted_tokens = compute_fine_grained_loss(
-                    model_name=args.pretrained_model,
-                    base_prompt=prompt,
-                    target=k,
-                    api=target_model_path,
-                    temperature=0.7
-                )
-                if isinstance(loss, float):
-                    if math.isnan(loss):
-                        loss = 0.0
-                    if math.isinf(loss):
-                        loss = 0.0
-                    loss = torch.tensor(loss, requires_grad=True, device=device)
+                # ========== [3] API 调用获取 rewards
+                with torch.no_grad():
+                    rewards = compute_fine_grained_batch_reward(
+                        model_name=args.pretrained_model,
+                        prompts=prompts,
+                        target=k,
+                        api=target_model_path
+                    )  # [N] Tensor
+                C=300
+                # ========== [4] 策略梯度损失
+                baseline = rewards.mean().detach()
+                advantage = torch.clamp(rewards - baseline, min=0)
+                policy_loss = - (advantage * seq_logps).mean()
+                policy_loss -= 0.01 * policy_entropy
 
-                print("loss", loss)
-                loss = 100 - loss
-                hes_loss = loss * 0.01 * 1 / 5
-
-                hes_weight = 5000
+                hes_loss = policy_loss + C
+                # ========== [5] 反向传播
+                hes_weight = 1
                 loss5 = hes_weight * hes_loss
-
-
-
-
 
 
         # 在计算 reject_loss 后，计算每个样本的拒绝概率向量
@@ -767,49 +809,38 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             computed.append("loss5")
         # —— 2. 针对每个子 loss 做 NaN 检查 & 回退/更新 ——
         #    这里不用 locals()，直接一个个写清楚
-        if torch.isnan(loss1).any():
-            logger.warning(
-                f"[iter {ite}] loss1 is NaN, revert to avg {last_losses['loss1'].mean().item():.6f}"
-            )
-            loss1 = last_losses["loss1"]
-        else:
-            last_losses["loss1"] = loss1.detach()
+        # 检查 loss 是否为 NaN，一旦有一个为 NaN 就跳过本轮
+        nan_detected = False
 
-        if torch.isnan(loss2).any():
-            logger.warning(
-                f"[iter {ite}] loss2 is NaN, revert to avg {last_losses['loss2'].mean().item():.6f}"
-            )
-            loss2 = last_losses["loss2"]
-        else:
-            last_losses["loss2"] = loss2.detach()
+        for i, loss_name in enumerate(["loss1", "loss2", "loss3", "loss4"]):
+            loss_tensor = locals()[loss_name]
+            if torch.isnan(loss_tensor).any():
+                logger.warning(
+                    f"[iter {ite}] {loss_name} is NaN, skipping current step."
+                )
+                nan_detected = True
+                break
+            else:
+                last_losses[loss_name] = loss_tensor.detach()
 
-        if torch.isnan(loss3).any():
-            logger.warning(
-                f"[iter {ite}] loss3 is NaN, revert to avg {last_losses['loss3'].mean().item():.6f}"
-            )
-            loss3 = last_losses["loss3"]
-        else:
-            last_losses["loss3"] = loss3.detach()
-
-        if torch.isnan(loss4).any():
-            logger.warning(
-                f"[iter {ite}] loss4 is NaN, revert to avg {last_losses['loss4'].mean().item():.6f}"
-            )
-            loss4 = last_losses["loss4"]
-        else:
-            last_losses["loss4"] = loss4.detach()
-
-        if ite >= 1000:
-            # 第一次进来时，给 loss5 一个初始历史值
+        # loss5 单独判断（只在迭代较多时开始使用）
+        if not nan_detected and ite >= 1000:
             if "loss5" not in last_losses:
                 last_losses["loss5"] = torch.tensor(0.0, device=device)
             if torch.isnan(loss5).any():
                 logger.warning(
-                    f"[iter {ite}] loss5 is NaN, revert to avg {last_losses['loss5'].mean().item():.6f}"
+                    f"[iter {ite}] loss5 is NaN, skipping current step."
                 )
-                loss5 = last_losses["loss5"]
+                nan_detected = True
             else:
                 last_losses["loss5"] = loss5.detach()
+
+        # 如果有 NaN，直接跳过当前 step
+        if nan_detected:
+            continue  # or `return` if you're in a function
+
+
+
 
         # 替换你的损失计算部分
         if ite >= 1000:
@@ -818,21 +849,30 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             loss_total = loss_balancer(loss1, loss2, loss3, loss4, None, current_step=ite)
 
         loss = loss_total.mean()
-        # l2_reg = torch.norm(epsilon) * 0.01
-        # loss += l2_reg
-        # accumulation_steps = 5
-        # loss = loss / accumulation_steps
-        # print("loss", loss)
-        # 如果不是最后一次迭代，进行反向传播和优化
 
-        # if ite >= 1000:
-        #     print(f"loss5.requires_grad: {loss5.requires_grad}")
-        # print(f"loss.requires_grad: {loss.requires_grad}")
-        # print(f"loss.grad_fn: {loss.grad_fn}")
+        if loss1.grad_fn is None:
+            print("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if loss2.grad_fn is None:
+            print("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if loss3.grad_fn is None:
+            print("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if loss4.grad_fn is None:
+            print("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if ite >= 1000:
+            if loss5.grad_fn is None:
+                print("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if loss.grad_fn is None:
+            print("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+
         if ite < args.num_iters - 1:
             try:
                 torch.cuda.empty_cache()  # 清理之前的缓存
-                loss.backward()
+                if debug_mode:
+                    with torch.autograd.set_detect_anomaly(True):
+                        loss.backward()
+                else:
+                    loss.backward()
+
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     print("[OOM] during loss.backward(). Try reducing batch or chunk_size.")
@@ -863,64 +903,36 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             text, _, last_text_ids = decode_with_model_topk(
                 proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None, bad_mask=None)
             text_post = text
-            if not  args.useapi:
-                all_prompts = []
-                all_outputs = []
-                all_scores = []
+            all_prompts = []
+            all_outputs = []
+            all_scores = []
+
+            if not args.useapi:
                 for bi in range(args.batch_size):
                     prompt = x + " " + text_post[bi]
-                    logger.info("[攻击中]:" )
-                    logger.info("[提示词输入]: %s" % prompt)
-                    # input_ids = proxy_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-                    inputs = target_tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+                    logger.info("[攻击中]:")
+                    logger.info("[提示词输入]: %s", prompt)
 
-                    # 从返回的字典中获取 input_ids 和 attention_mask
+                    inputs = target_tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
                     input_ids = inputs['input_ids'].to(target_model.device)
                     attention_mask = inputs['attention_mask'].to(target_model.device)
-                    logger.info("\n Output of the model:\n")
-                    output_ids = target_model.generate(inputs=input_ids, temperature=0.7, max_length=512, do_sample=True,
-                                                top_k=args.topk,attention_mask =attention_mask )
-                    #结果
-                    output=target_tokenizer.decode(output_ids[0], skip_special_tokens=True)
-                    # 对 output 做安全打分
+
+                    output_ids = target_model.generate(
+                        inputs=input_ids, temperature=0.7, max_length=512,
+                        do_sample=True, top_k=args.topk, attention_mask=attention_mask)
+                    output = target_tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
                     if has_meaningless_patterns(output):
-                        # 如果是“无意义”模式，直接给 0.0 分
                         prob = 0.0
                         raw = None
                     else:
-                        # 正常情况下调用接口打分
                         prob, raw = query_guard_vllm(output)
 
-                    # 统一记录日志和收集结果
                     logger.info("[output]   : %s", output)
                     logger.info("[UNSAFE]    : %s", prob)
                     all_prompts.append(prompt)
                     all_outputs.append(output)
                     all_scores.append(prob)
-
-                if not all_scores:
-                    logger.warning(f"[iter {ite}] 本轮没找到合格候选，跳过")
-                    continue
-
-                best_idx = all_scores.index(max(all_scores))
-                logger.info("===== 最佳 Prompt =====")
-                logger.info("Prompt: %s", all_prompts[best_idx])
-                logger.info("Output: %s", all_outputs[best_idx])
-                logger.info("UNSAFE 概率: %.4f", all_scores[best_idx])
-
-                if ite == 0:
-                    optimal_target = all_prompts[best_idx]
-
-                # 统计 all_scores 中有多少分数 > 0.8
-                count = sum(1 for score in all_scores if score > 0.8)
-                # 或者
-                # count = len([s for s in all_scores if s > 0.5])
-
-                logger.info("本轮中 UNSAFE 概率 > 0.8 的候选有 %d 条", count)
-                if count > 6:
-                    logger.info("提前结束")
-
-                    break
 
             else:
                 prompts = []
@@ -929,17 +941,48 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     logger.info(f"\n=== 准备批量 API 调用, 样本: {bi} ===")
                     logger.info(f"原始 prompt 内容: {prompt[:100]}...")
                     prompt = prompt.replace("</s>", " ").strip()
-                    if not prompt or prompt.isspace():
-                        logger.info("警告: 检测到空 prompt, 跳过生成")
-                        prompts.append("")  # 空 prompt 占位符
-                    else:
-                        prompts.append(prompt)
-                api_texts = call_api_completion(args.pretrained_model, args.api, prompts, max_tokens=512,
-                                                temperature=0.7)
+                    prompts.append(prompt if prompt and not prompt.isspace() else "")
+
+                api_texts = call_api_completion(
+                    args.pretrained_model, args.api, prompts, max_tokens=512, temperature=0.7)
+
                 logger.info(f"成功通过 API 批量生成文本, 生成结果数: {len(api_texts)}")
-                # print("api输出：",api_texts)
 
+                for bi, output in enumerate(api_texts):
+                    prompt = prompts[bi]
+                    if not prompt:
+                        continue
+                    if has_meaningless_patterns(output):
+                        prob = 0.0
+                        raw = None
+                    else:
+                        prob, raw = query_guard_vllm(output)
 
+                    logger.info("[output]   : %s", output)
+                    logger.info("[UNSAFE]    : %s", prob)
+                    all_prompts.append(prompt)
+                    all_outputs.append(output)
+                    all_scores.append(prob)
+
+            # === 统一处理部分 ===
+            if not all_scores:
+                logger.warning(f"[iter {ite}] 本轮没找到合格候选，跳过")
+                continue
+
+            best_idx = all_scores.index(max(all_scores))
+            logger.info("===== 最佳 Prompt =====")
+            logger.info("Prompt: %s", all_prompts[best_idx])
+            logger.info("Output: %s", all_outputs[best_idx])
+            logger.info("UNSAFE 概率: %.4f", all_scores[best_idx])
+
+            if ite == 0:
+                optimal_target = all_prompts[best_idx]
+
+            count = sum(1 for score in all_scores if score > 0.8)
+            logger.info("本轮中 UNSAFE 概率 > 0.8 的候选有 %d 条", count)
+            if count > 6:
+                logger.info("提前结束")
+                break
 
         if args.wandb:
             wandb_step = ite + 1
