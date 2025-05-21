@@ -32,7 +32,7 @@ from award.reaward import compute_adv_loss_from_safe_baseline_min_gap, build_saf
     batch_bleu_similarity_score, compute_rejection_prob_loss_avg_generate, \
     compute_rejection_prob_loss_avg_generate_guard, compute_rejection_prob_loss_weight_generate, \
     compute_semantic_reject_loss_steeper, find_most_matches, sample_and_get_logprobs, compute_policy_loss, \
-    query_guard_vllm, compute_perplexity
+    query_guard_vllm
 from model.Apimodel import compute_fine_grained_loss, call_api_completion, compute_fine_grained_batch_reward
 # from model.Apimodel import  call_api_completion
 from model.use_distilled_model import load_model
@@ -531,9 +531,9 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
         if optimal_target is None:
             z_onehot =z_onehot
             z_t = z_t
-        else :
-            z_onehot = optimal_onehot.repeat(args.batch_size, 1, 1)
-            z_t = optimal_target_t.unsqueeze(0).repeat(args.batch_size, 1)
+        # else :
+        #     z_onehot = optimal_onehot.repeat(args.batch_size, 1, 1)
+        #     z_t = optimal_target_t.unsqueeze(0).repeat(args.batch_size, 1)
 
         if args.straight_through:
             if mask_t is None:
@@ -861,6 +861,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             all_outputs = []
             all_scores = []
             fluencys= []
+            all_ppl = []
 
             if not args.useapi:
                 for bi in range(args.batch_size):
@@ -905,6 +906,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     all_outputs.append(output)
                     all_scores.append(prob)
                     fluencys.append(fluency)
+                    all_ppl.append(metrics['original_ppl'])
 
             else:
                 prompts = []
@@ -951,6 +953,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     all_outputs.append(output)
                     all_scores.append(prob)
                     fluencys.append(fluency)
+                    all_ppl.append(metrics['original_ppl'])
 
             # === 统一处理部分 ===
 
@@ -986,6 +989,8 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             optimal_target_t = torch.tensor(optimal_target_, device=device, dtype=torch.long)
 
             optimal_onehot = one_hot(optimal_target_t, dimension=proxy_tokenizer.vocab_size)
+            z_onehot = optimal_onehot.repeat(args.batch_size, 1, 1)
+            z_t = optimal_target_t.unsqueeze(0).repeat(args.batch_size, 1)
 
             count = sum(1 for score in all_scores if score > 0.8)
             logger.info("本轮中 UNSAFE 概率 > 0.8 的候选有 %d 条", count)
