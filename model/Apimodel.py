@@ -179,7 +179,7 @@ def get_target_token_logprob(
         for tok_str, logp in last2.items():
             if tok_str.strip() == tgt_stripped:
                 return logp, top2
-        logger.info(f"Top-5 tokens: {list(last_top.keys())}")
+        # logger.info(f"Top-5 tokens: {list(last_top.keys())}")
 
         return float('inf'), top2
 
