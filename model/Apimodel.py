@@ -5,6 +5,8 @@ import unittest
 import requests
 import logging
 from typing import List, Tuple ,Optional
+
+import torch
 from transformers import LlamaTokenizer
 
 # 配置日志
@@ -184,6 +186,39 @@ def get_target_token_logprob(
     except Exception as e:
         logger.error(f"Error in get_target_token_logprob for prompt '{prompt[:30]}...': {e}")
         return float('inf'), []
+
+def compute_fine_grained_batch_reward(
+    model_name: str,
+    prompts: List[str],
+    target: str,
+    api: str,
+    temperature: float = 0.7
+) -> torch.Tensor:
+    """
+    批量版本的 fine-grained loss 计算，返回 reward 向量 [N]
+    reward = 100 - loss（loss 越小表示越成功）
+    """
+    rewards = []
+    for prompt in prompts:
+        try:
+            loss, _ = compute_fine_grained_loss(
+                model_name=model_name,
+                base_prompt=prompt,
+                target=target,
+                api=api,
+                temperature=temperature
+            )
+        except Exception as e:
+            print(f"API Error: {e}")
+            loss = 100.0  # 大惩罚
+
+        if math.isnan(loss) or math.isinf(loss):
+            loss = 100.0  # 惩罚无效请求
+
+        reward = 100.0 - loss  # 越大越好
+        rewards.append(reward)
+
+    return torch.tensor(rewards, dtype=torch.float32, device='cuda')  # or proxy_model.device
 
 #
 # def compute_fine_grained_loss(
@@ -395,11 +430,11 @@ def compute_fine_grained_loss(
         )
 
         if lp == float('inf') or math.isnan(lp):
-            logger.warning(f"Token #{i} '{tok}' 获取 logprob 失败，记为极小概率")
+            # logger.warning(f"Token #{i} '{tok}' 获取 logprob 失败，记为极小概率")
             lp = -100.0  # 或者你想要的任意“惩罚性”值
             pred = ""
         else:
-            logger.warning(f"Token #{i} '{tok}' 获取 logprob 成功")
+            # logger.warning(f"Token #{i} '{tok}' 获取 logprob 成功")
             print(lp)
             pred = topk[0]  # 正常拿到就记录 top-1
 
