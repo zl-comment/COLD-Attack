@@ -181,9 +181,7 @@ def main():
     elif "control" in args.mode:
         from attack_control import attack_generation
         attack_generation(model, tokenizer, device, args)
-    elif "proxy_one" in args.mode:
-        from attack_suffix_proxy_one import attack_generation   ##再添加一个代理模型
-        attack_generation(model_path, device, args)
+
     elif "proxy" in args.mode:
         from attack_suffix_proxy import attack_generation   ##再添加一个代理模型
         attack_generation(model_path, device, args)
