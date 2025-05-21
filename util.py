@@ -16,13 +16,14 @@ import os
 
 from requests import delete
 
+from award.reaward import SafeLogitsProcessor
 from opt_util import load_model_and_tokenizer
 
 if os.path.isdir('/var/karen'):
     os.environ['TRANSFORMERS_CACHE'] = '/var/karen/workspace/Refinement-Generation/cache'
     sys.path.insert(0, '/var/karen/workspace/Refinement-Generation/')
 
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, LogitsProcessorList
 from tqdm import tqdm
 from difflib import SequenceMatcher
 
@@ -269,7 +270,7 @@ def initialize(model, x, length, temperature, batch_size, device, tokenizer):
     # output = model.generate(x, max_length=length + x.shape[-1])
     # logits = model(output).logits
 
-    output = model.generate(x, max_length=length + x.shape[-1], do_sample=True, top_k=10)
+    output = model.generate(x, max_length=length + x.shape[-1], do_sample=True, top_k=10,logits_processor=LogitsProcessorList([SafeLogitsProcessor()]))
     logits = model(output).logits
     logits_so_far = logits[:, -(length+1):-1, :] / temperature
     # print(logits_so_far.shape)
