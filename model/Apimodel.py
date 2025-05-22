@@ -435,7 +435,7 @@ def compute_fine_grained_loss(
             pred = ""
         else:
             # logger.warning(f"Token #{i} '{tok}' 获取 logprob 成功")
-            print(lp)
+            # print(lp)
             pred = topk[0]  # 正常拿到就记录 top-1
 
         total_loss += -lp
