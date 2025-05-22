@@ -351,13 +351,14 @@ def compute_entropy_loss_front(logits, top_n=10):
 #ent计算平均的token率
 def compute_entropy_loss(logits):
     """
-    logits: [batch, seq_len, vocab_size]
-    返回：熵损失（鼓励分布多样性，防止总是拒绝）
+    logits: Tensor of shape [batch_size, seq_len, vocab_size]
+    return: scalar loss (负熵，鼓励分布平滑)
     """
-    probs = F.softmax(logits, dim=-1)  # [B, T, V]
-    log_probs = torch.log(probs + 1e-10)
-    ent = - (probs * log_probs).sum(dim=-1)  # [B, T]
-    return -ent.mean()  # 注意是负熵 → 越分散越小，越集中越大
+    probs = F.softmax(logits, dim=-1)             # [B, L, V]
+    log_probs = F.log_softmax(logits, dim=-1)      # [B, L, V]
+    entropy = - (probs * log_probs).sum(dim=-1)    # [B, L]
+    return -entropy.mean()  # 负号：最大化熵
+
 
 
 def hesitation_loss_continuous(p, target=0.01, scale=300.0):
