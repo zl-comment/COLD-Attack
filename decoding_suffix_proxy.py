@@ -756,11 +756,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
 
         loss4 = kl_loss_weight * sem_loss  # 语义拒绝/KL损失
 
-        # 记录本轮计算到哪些 loss
-        computed = ["loss1", "loss2", "loss3", "loss4"]
 
-        if ite >= 1000:
-            computed.append("loss5")
         # —— 2. 针对每个子 loss 做 NaN 检查 & 回退/更新 ——
         #    这里不用 locals()，直接一个个写清楚
         # 检查 loss 是否为 NaN，一旦有一个为 NaN 就跳过本轮
@@ -792,6 +788,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
         # 如果有 NaN，直接跳过当前 step
         if nan_detected:
             continue  # or `return` if you're in a function
+
 
 
 
@@ -878,11 +875,8 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                         do_sample=True, top_k=args.topk, attention_mask=attention_mask)
                     output = target_tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-                    if has_meaningless_patterns(output):
-                        prob = 0.0
-                        raw = None
-                    else:
-                        prob, raw = query_guard_vllm(output)
+
+                    prob, raw = query_guard_vllm(output)
                     prompt_enc = proxy_tokenizer(prompt, return_tensors="pt", truncation=True)
                     input_ids_bi = prompt_enc["input_ids"][0]
                     fluency, metrics = compute_improved_fluency(input_ids_bi, proxy_model, proxy_tokenizer)
@@ -926,11 +920,9 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     prompt = prompts[bi]
                     if not prompt:
                         continue
-                    if has_meaningless_patterns(output):
-                        prob = 0.0
-                        raw = None
-                    else:
-                        prob, raw = query_guard_vllm(output)
+
+
+                    prob, raw = query_guard_vllm(output)
                     prompt_enc = proxy_tokenizer(prompt, return_tensors="pt", truncation=True)
                     input_ids_bi = prompt_enc["input_ids"][0]
                     fluency, metrics = compute_improved_fluency(input_ids_bi, proxy_model, proxy_tokenizer)
@@ -945,9 +937,8 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     logger.info(f"有效句子数: {metrics['valid_sentences']}")
                     logger.info(f"词汇多样性: {metrics['vocabulary_diversity']:.4f}")
                     logger.info(f"存在异常模式: {'是' if metrics['has_abnormal_patterns'] else '否'}")
-
                     logger.info("[output]   : %s", output)
-                    logger.info("[UNSAFE]    : %s", prob)
+                    logger.info("[UNSAFE]   : %s", prob)
                     logger.info("流畅度得分: %.4f", fluency)
                     all_prompts.append(prompt)
                     all_outputs.append(output)
