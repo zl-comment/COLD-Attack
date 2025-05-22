@@ -141,7 +141,7 @@ def top_k_filter_3d(logits, k, probs=False, mask=None, extra_mask=None, bad_mask
     extra_mask:[batch_size, length, vocab_size], 1 if reserve
     """
     # print("top_k_filter_3d: logits",logits)
-    BIG_CONST = 1e10
+    BIG_CONST = 1e4
     if k == 0:
         return logits
     else:
@@ -509,9 +509,9 @@ def soft_nll(logits_perturbed, logits, eps=1e-7):
     # print(f"logits: {logits.shape}, range: [{logits.min()}, {logits.max()}]")
     
     # 对logits进行裁剪防止极端值
-    logits_perturbed = torch.clamp(logits_perturbed, -100, 100)
-    logits = torch.clamp(logits, -100, 100)
-    
+    logits_perturbed = torch.nan_to_num(logits_perturbed, nan=0.0, neginf=-1e2, posinf=1e2)
+    logits = torch.nan_to_num(logits, nan=0.0, neginf=-1e2, posinf=1e2)
+
     # 计算softmax和log_softmax
     p = F.softmax(logits_perturbed, dim=-1)
     p = torch.clamp(p, min=eps)
