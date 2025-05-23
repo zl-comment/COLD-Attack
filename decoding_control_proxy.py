@@ -9,12 +9,14 @@ import logging
 from datetime import datetime
 
 import os.path as osp
+
+from award.ppl import compute_improved_fluency
 from award.reaward import \
      get_reject_token_ids, \
      compute_rejection_prob_loss_weight_generate, \
      find_most_matches,  \
     query_guard_vllm
-from model.Apimodel import compute_fine_grained_loss, call_api_completion
+from model.Apimodel import compute_fine_grained_loss, call_api_completion, compute_fine_grained_batch_reward
 
 from util import *
 
@@ -141,64 +143,19 @@ def decode(target_model_path,target_model, target_tokenizer, proxy_model, proxy_
     torch.cuda.empty_cache()
 
 
-    text, _, last_text_ids ,decoded_text= decode_proxy_little(target_model_path,target_model, target_tokenizer, proxy_model, proxy_tokenizer, device, x, z,key_word,
+    all_ppl,text, decoded_text= decode_proxy_little(target_model_path,target_model, target_tokenizer, proxy_model, proxy_tokenizer, device, x, z,key_word,
                                                  constraints, args, sys_prompt, prefix, model_back, zz)
 
     # 清理代理模型 GPU 内存
-    del proxy_model, proxy_tokenizer
     torch.cuda.empty_cache()
     torch.cuda.synchronize()  # 等待所有 CUDA 操作完成
     text_post = text
-    # 如果使用 API 模式，则无需加载目标模型进行生成
-    if args.useapi:
-        print("使用 API 模式进行生成，不加载本地目标模型")
-        prompts = []
-        prompt_with_adv = []
-        for bi in range(args.batch_size):
-            prompt = x + " " + text_post[bi]
-            print(f"\n=== 准备批量 API 调用, 样本: {bi} ===")
-            print(f"原始 prompt 内容: {prompt[:100]}...")
-            prompt = prompt.replace("</s>", " ").strip()
-            if not prompt or prompt.isspace():
-                print("警告: 检测到空 prompt, 跳过生成")
-                prompts.append("")  # 空 prompt 占位符
-            else:
-                prompts.append(prompt)
-            prompt_with_adv.append(x + " " + text_post[bi])
 
-        print("\n=== 开始批量 API 生成过程 ===")
-        try:
-            # 批量调用 API 生成文本
-            api_texts = call_api_completion(args.pretrained_model, args.api, prompts, max_tokens=512,
-                                            temperature=0.7)
-            print(f"成功通过 API 批量生成文本, 生成结果数: {len(api_texts)}")
-        except Exception as e:
-            print(f"API 生成过程中错误: {str(e)}")
-            # 出现错误时，对每个 prompt 返回空文本
-            api_texts = ["" for _ in prompts]
-        print("\n=== 批量 API 生成过程完成 ===")
+    print(f"成功生成的文本数量: {len([t for t in decoded_text if t])}/{args.batch_size}")
 
-        # 由于没有加载目标模型，此处困惑度计算无法进行，可设置为 None 或其他默认值
-        ppl = None
-        return ppl, text, text_post, api_texts, prompt_with_adv
+    prompt_with_adv = [x + " " + t for t in text_post]
 
-    else:
-        # 非 API 模式，加载本地目标模型和分词器
-
-        print("\n=== 本地生成过程完成 ===")
-        print(f"成功生成的文本数量: {len([t for t in decoded_text if t])}/{args.batch_size}")
-
-        # 计算 perplexity（使用本地目标模型计算困惑度）
-        last_text_ids = last_text_ids.to(target_model.device)
-        last_rank_loss = target_model(input_ids=last_text_ids, labels=last_text_ids).loss
-        last_rank_loss = last_rank_loss.detach().clone().data.cpu().numpy()
-        ppl_last = np.exp(last_rank_loss)  # 代表一个批次的平均困惑度
-        ppl = [ppl_last for _ in range(args.batch_size)]
-        prompt_with_adv = [x + " " + t for t in text_post]
-
-
-
-        return ppl, text, text_post, decoded_text, prompt_with_adv
+    return all_ppl, text, text_post, decoded_text, prompt_with_adv
 
 
 def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_model, proxy_tokenizer, device, x="", z="", key_word="", constraints=None, args=None, sys_prompt=None, prefix=None, model_back=None, zz=None):
@@ -478,7 +435,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             ngram_list=[1]
         )
         # ========== 每轮 ite >= 1000 时执行 ==========
-        if iter >= 1000:
+        if ite >= 1000:
             if not args.useapi:
                 from torch.distributions import Categorical
 
@@ -486,6 +443,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                 N, T, V = y_logits_.shape
                 logps_list = []
                 tokens = []
+                entropies = []
                 for t in range(T):
                     # 每个 step 直接用扰动后 logits 采样
                     step_logits = y_logits_[:, t, :]  # [N, V]
@@ -493,9 +451,10 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     tok = dist.sample()  # [N]
                     logps_list.append(dist.log_prob(tok))
                     tokens.append(tok)
+                    entropies.append(dist.entropy())
                 seq_logps = torch.stack(logps_list, dim=1).sum(dim=1)  # [N]
                 generated_ids = torch.stack(tokens, dim=1)  # [N, T]
-
+                policy_entropy = torch.stack(entropies, dim=1).mean()  # scalar
                 # 3) 黑盒 target_model 评判 → 得到 batch_reject_losses: [N]
                 with torch.no_grad():
                     _, batch_reject_losses, _ = compute_rejection_prob_loss_weight_generate(
@@ -511,48 +470,90 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                                                    device=seq_logps.device)
 
                 # 4) 策略梯度损失（REINFORCE）
+                # rewards = - batch_reject_losses
+                # baseline = rewards.mean().detach()
+                # advantage = rewards - baseline
+                # policy_loss = - (advantage * seq_logps).mean()
+                C = 300
                 rewards = - batch_reject_losses
                 baseline = rewards.mean().detach()
-                advantage = rewards - baseline
+                advantage = torch.clamp(rewards - baseline, min=0)  # ✅ 只强化好样本
                 policy_loss = - (advantage * seq_logps).mean()
-                C = 300
-                # min_val = policy_loss.min().detach()  # negative or zero
-                # # 只有当 min_val < 0 时才平移，否则不变
-                # shift = torch.clamp(-min_val, min=0)
+
+                policy_loss -= 0.01 * policy_entropy
+
                 hes_loss = policy_loss + C  # 现在 loss5 ≥ 0，且保留了 policy_loss 之间的差距
 
                 hes_weight = 1
                 loss5 = hes_weight * hes_loss
 
             else:
-                text, _, last_text_ids = decode_with_model_topk(
-                    proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
-                    bad_mask=None)
+                # text, _, last_text_ids = decode_with_model_topk(
+                #     proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
+                #     bad_mask=None)
+                #
+                # keywords = lowercase_words
+                # _, _, text = find_most_matches(text, keywords)
+                #
+                # prompt = x + " " + text
+                #
+                # loss, predicted_tokens = compute_fine_grained_loss(
+                #     model_name=args.pretrained_model,
+                #     base_prompt=prompt,
+                #     target=k,
+                #     api=target_model_path,
+                #     temperature=0.7
+                # )
+                # if isinstance(loss, float):
+                #     if math.isnan(loss):
+                #         loss = 0.0
+                #     if math.isinf(loss):
+                #         loss = 0.0
+                #     loss = torch.tensor(loss, requires_grad=True, device=device)
+                #
+                # print("loss", loss)
+                # loss = 100 - loss
+                # hes_loss = loss * 0.01 * 1 / 5
+                #
+                # hes_weight = 5000
+                # loss5 = hes_weight * hes_loss
+                # ========== [1] 从 y_logits_ 采样
+                from torch.distributions import Categorical
+                logps_list, tokens, entropies = [], [], []
+                for t in range(y_logits_.shape[1]):
+                    step_logits = y_logits_[:, t, :]
+                    dist = Categorical(logits=step_logits)
+                    tok = dist.sample()
+                    logps_list.append(dist.log_prob(tok))
+                    tokens.append(tok)
+                    entropies.append(dist.entropy())
 
-                keywords = lowercase_words
-                _, _, text = find_most_matches(text, keywords)
+                seq_logps = torch.stack(logps_list, dim=1).sum(dim=1)
+                generated_ids = torch.stack(tokens, dim=1)
+                policy_entropy = torch.stack(entropies, dim=1).mean()
 
-                prompt = x + " " + text
+                # ========== [2] 解码
+                texts = proxy_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                prompts = [x + " " + t for t in texts]
 
-                loss, predicted_tokens = compute_fine_grained_loss(
-                    model_name=args.pretrained_model,
-                    base_prompt=prompt,
-                    target=k,
-                    api=target_model_path,
-                    temperature=0.7
-                )
-                if isinstance(loss, float):
-                    if math.isnan(loss):
-                        loss = 0.0
-                    if math.isinf(loss):
-                        loss = 0.0
-                    loss = torch.tensor(loss, requires_grad=True, device=device)
+                # ========== [3] API 调用获取 rewards
+                with torch.no_grad():
+                    rewards = compute_fine_grained_batch_reward(
+                        model_name=args.pretrained_model,
+                        prompts=prompts,
+                        target=k,
+                        api=target_model_path
+                    )  # [N] Tensor
+                C = 300
+                # ========== [4] 策略梯度损失
+                baseline = rewards.mean().detach()
+                advantage = torch.clamp(rewards - baseline, min=0)
+                policy_loss = - (advantage * seq_logps).mean()
+                policy_loss -= 0.01 * policy_entropy
 
-                print("loss", loss)
-                loss = 100 - loss
-                hes_loss = loss * 0.01 * 1 / 5
-
-                hes_weight = 5000
+                hes_loss = policy_loss + C
+                # ========== [5] 反向传播
+                hes_weight = 1
                 loss5 = hes_weight * hes_loss
 
         if iter >=1000:
@@ -577,70 +578,56 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
 
         pbar.set_postfix(loss=loss.item())
 
-        if args.verbose and ((iter + 1) % args.print_every == 0 or iter == 0 or iter + 1 == args.num_iters):
+        if (ite + 1) % args.print_every == 0 or ite == 0 or ite + 1 == args.num_iters:
             text, _, last_text_ids = decode_with_model_topk(
                 proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
                 bad_mask=None)
             text_post = text
+            all_prompts = []
+            all_outputs = []
+            all_scores = []
+            fluencys = []
+            all_ppl = []
+
             if not args.useapi:
-                all_prompts = []
-                all_outputs = []
-                all_scores = []
                 for bi in range(args.batch_size):
                     prompt = x + " " + text_post[bi]
                     logger.info("[攻击中]:")
-                    logger.info("[提示词输入]: %s" % prompt)
-                    # input_ids = proxy_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-                    inputs = target_tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+                    logger.info("[提示词输入]: %s", prompt)
 
-                    # 从返回的字典中获取 input_ids 和 attention_mask
+                    inputs = target_tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
                     input_ids = inputs['input_ids'].to(target_model.device)
                     attention_mask = inputs['attention_mask'].to(target_model.device)
-                    logger.info("\n Output of the model:\n")
-                    output_ids = target_model.generate(inputs=input_ids, temperature=0.7, max_length=512,
-                                                       do_sample=True,
-                                                       top_k=args.topk, attention_mask=attention_mask)
-                    # 结果
-                    output = target_tokenizer.decode(output_ids[0], skip_special_tokens=True)
-                    # 对 output 做安全打分
-                    if has_meaningless_patterns(output):
-                        # 如果是“无意义”模式，直接给 0.0 分
-                        prob = 0.0
-                        raw = None
-                    else:
-                        # 正常情况下调用接口打分
-                        prob, raw = query_guard_vllm(output)
 
-                    # 统一记录日志和收集结果
+                    output_ids = target_model.generate(
+                        inputs=input_ids, temperature=0.7, max_length=512,
+                        do_sample=True, top_k=args.topk, attention_mask=attention_mask)
+                    output = target_tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+                    prob, raw = query_guard_vllm(output)
+                    prompt_enc = proxy_tokenizer(prompt, return_tensors="pt", truncation=True)
+                    input_ids_bi = prompt_enc["input_ids"][0]
+                    fluency, metrics = compute_improved_fluency(input_ids_bi, proxy_model, proxy_tokenizer)
+                    # 打印详细结果
+                    logger.info(f"流畅度评分: {fluency:.4f} (0-1范围，越高越好)")
+                    logger.info(f"原始PPL: {metrics['original_ppl']:.4f}")
+                    logger.info(f"加权PPL: {metrics['weighted_ppl']:.4f}")
+                    logger.info(f"内容比例: {metrics['content_ratio']:.4f}")
+                    logger.info(f"特殊符号比例: {metrics['special_token_ratio']:.4f}")
+                    logger.info(f"最大连续重复: {metrics['max_consecutive_repeats']}")
+                    logger.info(f"平均token熵: {metrics['avg_token_entropy']:.4f}")
+                    logger.info(f"有效句子数: {metrics['valid_sentences']}")
+                    logger.info(f"词汇多样性: {metrics['vocabulary_diversity']:.4f}")
+                    logger.info(f"存在异常模式: {'是' if metrics['has_abnormal_patterns'] else '否'}")
+
                     logger.info("[output]   : %s", output)
                     logger.info("[UNSAFE]    : %s", prob)
+                    logger.info("流畅度得分: %.4f", fluency)
                     all_prompts.append(prompt)
                     all_outputs.append(output)
                     all_scores.append(prob)
-
-                if not all_scores:
-                    logger.warning(f"[iter {iter}] 本轮没找到合格候选，跳过")
-                    continue
-
-                best_idx = all_scores.index(max(all_scores))
-                logger.info("===== 最佳 Prompt =====")
-                logger.info("Prompt: %s", all_prompts[best_idx])
-                logger.info("Output: %s", all_outputs[best_idx])
-                logger.info("UNSAFE 概率: %.4f", all_scores[best_idx])
-
-                if iter == 0:
-                    optimal_target = all_prompts[best_idx]
-
-                # 统计 all_scores 中有多少分数 > 0.8
-                count = sum(1 for score in all_scores if score > 0.8)
-                # 或者
-                # count = len([s for s in all_scores if s > 0.5])
-
-                logger.info("本轮中 UNSAFE 概率 > 0.8 的候选有 %d 条", count)
-                if count > 6:
-                    logger.info("提前结束")
-
-                    break
+                    fluencys.append(fluency)
+                    all_ppl.append(metrics['original_ppl'])
 
             else:
                 prompts = []
@@ -649,14 +636,82 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     logger.info(f"\n=== 准备批量 API 调用, 样本: {bi} ===")
                     logger.info(f"原始 prompt 内容: {prompt[:100]}...")
                     prompt = prompt.replace("</s>", " ").strip()
-                    if not prompt or prompt.isspace():
-                        logger.info("警告: 检测到空 prompt, 跳过生成")
-                        prompts.append("")  # 空 prompt 占位符
-                    else:
-                        prompts.append(prompt)
-                api_texts = call_api_completion(args.pretrained_model, args.api, prompts, max_tokens=512,
-                                                temperature=0.7)
+                    prompts.append(prompt if prompt and not prompt.isspace() else "")
+
+                api_texts = call_api_completion(
+                    args.pretrained_model, args.api, prompts, max_tokens=512, temperature=0.7)
+
                 logger.info(f"成功通过 API 批量生成文本, 生成结果数: {len(api_texts)}")
+
+                for bi, output in enumerate(api_texts):
+                    prompt = prompts[bi]
+                    if not prompt:
+                        continue
+
+                    prob, raw = query_guard_vllm(output)
+                    prompt_enc = proxy_tokenizer(prompt, return_tensors="pt", truncation=True)
+                    input_ids_bi = prompt_enc["input_ids"][0]
+                    fluency, metrics = compute_improved_fluency(input_ids_bi, proxy_model, proxy_tokenizer)
+                    # 打印详细结果
+                    logger.info(f"流畅度评分: {fluency:.4f} (0-1范围，越高越好)")
+                    logger.info(f"原始PPL: {metrics['original_ppl']:.4f}")
+                    logger.info(f"加权PPL: {metrics['weighted_ppl']:.4f}")
+                    logger.info(f"内容比例: {metrics['content_ratio']:.4f}")
+                    logger.info(f"特殊符号比例: {metrics['special_token_ratio']:.4f}")
+                    logger.info(f"最大连续重复: {metrics['max_consecutive_repeats']}")
+                    logger.info(f"平均token熵: {metrics['avg_token_entropy']:.4f}")
+                    logger.info(f"有效句子数: {metrics['valid_sentences']}")
+                    logger.info(f"词汇多样性: {metrics['vocabulary_diversity']:.4f}")
+                    logger.info(f"存在异常模式: {'是' if metrics['has_abnormal_patterns'] else '否'}")
+                    logger.info("[output]   : %s", output)
+                    logger.info("[UNSAFE]   : %s", prob)
+                    logger.info("流畅度得分: %.4f", fluency)
+                    all_prompts.append(prompt)
+                    all_outputs.append(output)
+                    all_scores.append(prob)
+                    fluencys.append(fluency)
+                    all_ppl.append(metrics['original_ppl'])
+
+            # === 统一处理部分 ===
+
+            if not all_scores:
+                logger.warning(f"[iter {ite}] 本轮没找到合格候选，跳过")
+                continue
+
+            alpha = 0.7  # 越大越看重危险性，越小越看重流畅
+            # 找到最大和最小的值 把整个区间放大到0到1之间
+            f_min, f_max = min(fluencys), max(fluencys)
+            normalized_fluencys = [
+                (f - f_min) / (f_max - f_min + 1e-6) for f in fluencys
+            ]
+
+            combined_scores = [
+                alpha * unsafe + (1 - alpha) * fluency
+                for unsafe, fluency in zip(all_scores, normalized_fluencys)
+            ]
+
+            best_idx = combined_scores.index(max(combined_scores))
+
+            logger.info("===== 最佳综合 Prompt =====")
+            logger.info("Prompt: %s", all_prompts[best_idx])
+            logger.info("Output: %s", all_outputs[best_idx])
+            logger.info("UNSAFE 概率: %.4f", all_scores[best_idx])
+            logger.info("流畅度得分: %.4f", normalized_fluencys[best_idx])
+
+            # 最佳目标替换
+            optimal_target = all_prompts[best_idx]
+            optimal_target_ = proxy_tokenizer.encode(optimal_target)[1:]
+            optimal_target_t = torch.tensor(optimal_target_, device=device, dtype=torch.long)
+
+            optimal_onehot = one_hot(optimal_target_t, dimension=proxy_tokenizer.vocab_size)
+            z_onehot = optimal_onehot.repeat(args.batch_size, 1, 1)
+            z_t = optimal_target_t.unsqueeze(0).repeat(args.batch_size, 1)
+
+            count = sum(1 for score in all_scores if score > 0.8)
+            logger.info("本轮中 UNSAFE 概率 > 0.8 的候选有 %d 条", count)
+            if count > 6:
+                logger.info("提前结束")
+                break
         # ## noise
 
         if args.wandb:
@@ -710,4 +765,4 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     y_logits = y_logits + noise
 
     
-    return text, _, last_text_ids,all_outputs
+    return all_ppl,text, all_outputs
