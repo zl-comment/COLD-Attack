@@ -286,7 +286,7 @@ def decode(target_model_path,target_model, target_tokenizer, proxy_model, proxy_
     torch.cuda.empty_cache()
 
 
-    all_ppl,text, _, last_text_ids ,decoded_text= decode_proxy_little(target_model_path,target_model, target_tokenizer, proxy_model, proxy_tokenizer, device, x, z,
+    all_ppl,text,decoded_text= decode_proxy_little(target_model_path,target_model, target_tokenizer, proxy_model, proxy_tokenizer, device, x, z,
                                                  constraints, args, sys_prompt, prefix, model_back, zz)
 
 
@@ -1067,8 +1067,6 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                 else:
                     y_logits = y_logits + noise
     #打印
-    text, _, last_text_ids = decode_with_model_topk(
-        proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
-        bad_mask=None)
 
-    return all_ppl,text, _, last_text_ids,all_outputs
+
+    return all_ppl,text,all_outputs
