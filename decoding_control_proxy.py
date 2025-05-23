@@ -588,10 +588,13 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             all_scores = []
             fluencys = []
             all_ppl = []
+            suffixes = []
 
             if not args.useapi:
                 for bi in range(args.batch_size):
                     prompt = x + " " + text_post[bi]
+                    suffix = text_post[bi].strip()
+                    suffixes.append(suffix)
                     logger.info("[攻击中]:")
                     logger.info("[提示词输入]: %s", prompt)
 
@@ -601,12 +604,13 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
 
                     output_ids = target_model.generate(
                         inputs=input_ids, temperature=0.7, max_length=512,
-                        do_sample=True, top_k=args.topk, attention_mask=attention_mask)
+                        do_sample=True, top_k=args.topk, attention_mask=attention_mask,
+                        logits_processor=LogitsProcessorList([SafeLogitsProcessor()]))
                     output = target_tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
                     prob, raw = query_guard_vllm(output)
-                    prompt_enc = proxy_tokenizer(prompt, return_tensors="pt", truncation=True)
-                    input_ids_bi = prompt_enc["input_ids"][0]
+                    suffix_enc = proxy_tokenizer(suffix, return_tensors="pt", truncation=True)
+                    input_ids_bi = suffix_enc["input_ids"][0]
                     fluency, metrics = compute_improved_fluency(input_ids_bi, proxy_model, proxy_tokenizer)
                     # 打印详细结果
                     logger.info(f"流畅度评分: {fluency:.4f} (0-1范围，越高越好)")
@@ -633,6 +637,8 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                 prompts = []
                 for bi in range(args.batch_size):
                     prompt = x + " " + text_post[bi]
+                    suffix = text_post[bi].strip()
+                    suffixes.append(suffix)
                     logger.info(f"\n=== 准备批量 API 调用, 样本: {bi} ===")
                     logger.info(f"原始 prompt 内容: {prompt[:100]}...")
                     prompt = prompt.replace("</s>", " ").strip()
@@ -644,13 +650,14 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                 logger.info(f"成功通过 API 批量生成文本, 生成结果数: {len(api_texts)}")
 
                 for bi, output in enumerate(api_texts):
-                    prompt = prompts[bi]
-                    if not prompt:
+                    suffix = suffixes[bi]
+
+                    if not suffix:
                         continue
 
                     prob, raw = query_guard_vllm(output)
-                    prompt_enc = proxy_tokenizer(prompt, return_tensors="pt", truncation=True)
-                    input_ids_bi = prompt_enc["input_ids"][0]
+                    suffix_enc = proxy_tokenizer(suffix, return_tensors="pt", truncation=True)
+                    input_ids_bi = suffix_enc["input_ids"][0]
                     fluency, metrics = compute_improved_fluency(input_ids_bi, proxy_model, proxy_tokenizer)
                     # 打印详细结果
                     logger.info(f"流畅度评分: {fluency:.4f} (0-1范围，越高越好)")
@@ -666,7 +673,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                     logger.info("[output]   : %s", output)
                     logger.info("[UNSAFE]   : %s", prob)
                     logger.info("流畅度得分: %.4f", fluency)
-                    all_prompts.append(prompt)
+                    all_prompts.append(x + " " + suffix)
                     all_outputs.append(output)
                     all_scores.append(prob)
                     fluencys.append(fluency)
@@ -675,7 +682,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             # === 统一处理部分 ===
 
             if not all_scores:
-                logger.warning(f"[iter {ite}] 本轮没找到合格候选，跳过")
+                logger.warning(f"[iter {iter}] 本轮没找到合格候选，跳过")
                 continue
 
             alpha = 0.7  # 越大越看重危险性，越小越看重流畅
