@@ -468,7 +468,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
     # 初始化（放在模型定义部分）
     # loss_balancer = UncertaintyWeighting().to(device)
     # 突出第3项(loss3)，让 λ₃ 靠近 -2.0，正则强度 γ=0.5
-    loss_balancer = UncertaintyWeighting(highlight_idx=1, target_lambda=-1.0, gamma=0.5,switch_step = 0).to(device)
+    loss_balancer = UncertaintyWeighting(highlight_idx=0, target_lambda=-1.0, gamma=0.5,switch_step = 0).to(device)
     epsilon = torch.nn.Parameter(torch.zeros_like(y_logits, dtype=torch.float32), requires_grad=True)
     #原来的
     optim = torch.optim.AdamW(
@@ -553,8 +553,17 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
         else:
             _, indices_t = torch.topk(y_logits_t, args.topk)
             mask_t = torch.zeros_like(y_logits_t).scatter_(2, indices_t, 1)
-        flu_loss = soft_nll(top_k_compensate(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=None, bad_mask=None),
+        distill_loss = soft_nll(top_k_compensate(y_logits_t / args.output_lgt_temp, args.topk, extra_mask=None, bad_mask=None),
                             y_logits_ / args.input_lgt_temp)
+        #流畅度loss
+        entropy_val = compute_entropy_loss(y_logits_)  # 是负的，requires_grad=True
+
+        # baseline 不使用 entropy_val 自身，而是一个固定值或 moving average（保持常数，不断图）
+        entropy_baseline = torch.tensor(-1.0, device=entropy_val.device)  # 代表熵的上限估计
+
+        # 这句是“负熵 → 正值”，可参与 loss_balancer
+        flu_loss = 0.6*(entropy_baseline - entropy_val + 1.0)+0.4*distill_loss
+
         soft_forward_y_ = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
         if args.fp16 :
             with torch.autocast(device_type="cuda", dtype=torch.float16):
