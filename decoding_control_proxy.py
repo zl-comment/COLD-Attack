@@ -2,6 +2,7 @@ import math
 
 import time
 
+from pip._internal.cli.cmdoptions import debug_mode
 
 import wandb
 import logging
@@ -364,11 +365,20 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
 
     mask_t = None
     pbar = tqdm(range(args.num_iters), desc="Optimizing")
+
+    optimal_target = None
+    optimal_onehot = None
+    optimal_target_t = None
     for iter in pbar:
         optim.zero_grad()
 
         y_logits_ = y_logits + epsilon
         soft_forward_y = y_logits_ / 0.001
+
+        if optimal_target is None:
+            target_onehot = target_onehot
+            target_t = target_t
+
         if args.straight_through:
             if mask_t is None:
                 soft_forward_y = (y_logits_.detach() / 0.001 - y_logits_).detach() + y_logits_
@@ -435,7 +445,7 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             ngram_list=[1]
         )
         # ========== 每轮 ite >= 1000 时执行 ==========
-        if ite >= 1000:
+        if iter >= 1000:
             if not args.useapi:
                 from torch.distributions import Categorical
 
@@ -562,8 +572,45 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             loss = loss_balancer(c_loss_1, flu_loss, c_loss_3, c_loss_2, None, current_step=iter)
         loss = loss.mean()
 
-        if iter < args.num_iters - 1:  # so that the mask_t at the last iteration will not change
-            loss.backward()
+        if c_loss_1.grad_fn is None:
+            logger.warning("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if flu_loss.grad_fn is None:
+            logger.warning("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if c_loss_3.grad_fn is None:
+            logger.warning("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if c_loss_2.grad_fn is None:
+            logger.warning("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if iter >= 1000:
+            if loss5.grad_fn is None:
+                logger.warning("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+        if loss.grad_fn is None:
+            logger.warning("[警告] loss 没有 grad_fn，无法反向传播！可能被 detach 或 item 了。")
+
+        if iter < args.num_iters - 1:
+            try:
+                torch.cuda.empty_cache()  # 清理之前的缓存
+                if debug_mode:
+                    with torch.autograd.set_detect_anomaly(True):
+                        loss.backward()
+                else:
+                    loss.backward()
+
+                if epsilon.grad is None:
+                    logger.warning("[警告] epsilon 没有梯度！说明没有 loss 反向传播到 epsilon。")
+                else:
+                    if torch.all(epsilon.grad == 0):
+                        logger.warning("[警告] epsilon 梯度全为 0！可能 loss 与 epsilon 无关，或梯度消失。")
+
+
+
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print("[OOM] during loss.backward(). Try reducing batch or chunk_size.")
+                    torch.cuda.empty_cache()
+                    raise
+                else:
+                    raise
+
             optim.step()
             with torch.no_grad():
                 # element‐wise clamp，把每个分量限制到 [–10000,10000]
@@ -574,11 +621,10 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
                                                 neginf=-10000.0)
 
             scheduler.step()
-            last_lr = scheduler.get_last_lr()[0]
-
+        # 关注loss
         pbar.set_postfix(loss=loss.item())
 
-        if (ite + 1) % args.print_every == 0 or ite == 0 or ite + 1 == args.num_iters:
+        if (iter + 1) % args.print_every == 0 or iter == 0 or iter + 1 == args.num_iters:
             text, _, last_text_ids = decode_with_model_topk(
                 proxy_model, y_logits_, args.topk, soft_forward_x, x_model_past, proxy_tokenizer, extra_mask=None,
                 bad_mask=None)
@@ -651,7 +697,6 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
 
                 for bi, output in enumerate(api_texts):
                     suffix = suffixes[bi]
-
                     if not suffix:
                         continue
 
@@ -711,8 +756,8 @@ def decode_proxy_little(target_model_path,target_model, target_tokenizer,proxy_m
             optimal_target_t = torch.tensor(optimal_target_, device=device, dtype=torch.long)
 
             optimal_onehot = one_hot(optimal_target_t, dimension=proxy_tokenizer.vocab_size)
-            z_onehot = optimal_onehot.repeat(args.batch_size, 1, 1)
-            z_t = optimal_target_t.unsqueeze(0).repeat(args.batch_size, 1)
+            target_onehot = optimal_onehot.repeat(args.batch_size, 1, 1)
+            target_t = optimal_target_t.unsqueeze(0).repeat(args.batch_size, 1)
 
             count = sum(1 for score in all_scores if score > 0.8)
             logger.info("本轮中 UNSAFE 概率 > 0.8 的候选有 %d 条", count)
