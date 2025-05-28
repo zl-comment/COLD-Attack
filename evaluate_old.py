@@ -131,6 +131,9 @@ def run(args):
     if args.data_path == 'harmful_behaviors_custom':
         data = pd.read_csv(f"./data/advbench/{args.data_path}.csv")
         goals = data['goal'].tolist()[args.start:args.end + 1]
+    elif args.data_path=='harmful_behaviors_custom_keywords':
+        data = pd.read_csv(f"./data/advbench/{args.data_path}.csv")
+        goals = data['goal'].tolist()[args.start:args.end + 1]
     else:
         data = pd.read_csv(f"./data/CNsafe_RT_English/{args.data_path}.csv")
         goals = data['goal'].tolist()[args.start:args.end]
@@ -216,7 +219,7 @@ if __name__ == "__main__":
     parser.add_argument("--rej-weight", type=float, default=500.0)
     parser.add_argument("--defense-method", type=str, default="none")
     parser.add_argument("--mode", type=str, default='proxy',
-                        choices=['suffix', 'control', 'paraphrase', 'proxy', 'proxy_one'])
+                        choices=['suffix', 'control', 'paraphrase', 'proxy','control_proxy'])
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--data_path", type=str, default="harmful_behaviors_custom")
 

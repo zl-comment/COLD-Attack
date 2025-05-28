@@ -64,15 +64,16 @@ def attack_generation(model, tokenizer, device, args, model_back=None):
 
             text_candidates.extend(text)
             text_complete_candidates.extend(text_post)
-
-            outputs.extend(decoded_text) 
+            outputs.extend(decoded_text)
             prompts.extend([x] * args.batch_size)
             prompts_with_adv.extend(p_with_adv)
+            ppls.extend(_)
             results = pd.DataFrame()
-            results["prompt"] = [line.strip() for line in prompts]  
-            results["prompt_with_adv"] = prompts_with_adv           
-            results["output"] = outputs                       
+            results["prompt"] = [line.strip() for line in prompts]
+            results["prompt_with_adv"] = prompts_with_adv
+            results["output"] = outputs
             results["adv"] = text_complete_candidates
+            results["ppl"] = ppls
 
         print(results)
 

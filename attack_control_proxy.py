@@ -101,14 +101,16 @@ def attack_generation(target_model_path, device, args, model_back=None, ppl_last
                 results["ppl"] = ppls
         #保存每个循环的results
         print(results)
+        filename = (
+            f"outputs/{file_name}/{args.pretrained_model}/{args.proxy_model}/"
+            f"{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_"
+            f"{args.kl_max_weight:.4f}_{args.goal_weight:.4f}_{args.rej_weight:.4f}_{args.cw_weight:.4f}.csv"
+        )
 
         # 检查文件是否存在
-        if osp.exists(f"outputs/{file_name}/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv"):
-            # 如果文件存在，直接覆盖写（会覆盖原有内容，写入新内容）
-            results.to_csv(f"outputs/{file_name}/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv", mode='w', header=True)
+        if osp.exists(filename):
+            results.to_csv(filename, mode='w', header=True, float_format='%.4f')
         else:
-            # 如果文件不存在，创建新文件并写入（会写入列头）
-            results.to_csv(f"outputs/{file_name}/{args.pretrained_model}/{args.proxy_model}/{args.start}_{args.end}_{args.mode}_{args.batch_size}_{args.num_iters}_{args.kl_max_weight}_{args.goal_weight}_{args.rej_weight}_{args.cw_weight}.csv", mode='w', header=True)
-
+            results.to_csv(filename, mode='w', header=True, float_format='%.4f')
 
     print("finished")
