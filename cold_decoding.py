@@ -141,6 +141,7 @@ def main():
         "vicuna-7b-v1.5": os.path.join(base_dir, "vicuna-7b-v1.5"),
         "guanaco-7b": os.path.join(base_dir, "guanaco-7B-HF"),
         "mistral-7b": os.path.join(base_dir, "Mistral-7B-Instruct-v0.2"),
+        "proxy_model_v2": os.path.join(base_dir, "proxy_model_v2"),
     }
     if args.useapi:
         model_path =args.api
