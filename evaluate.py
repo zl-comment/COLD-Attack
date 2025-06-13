@@ -78,8 +78,8 @@ class CustomOllamaClient:
             return self.client.chat(model=model, messages=messages, options=options)
 
 # Use local Ollama by default
-# client = CustomOllamaClient(host='http://127.0.0.1:11434')
-client = CustomOllamaClient(host='http://192.168.124.3:11434')
+client = CustomOllamaClient(host='http://127.0.0.1:11434')
+# client = CustomOllamaClient(host='http://192.168.124.3:11434')
 
 # To use remote API, uncomment this line:
 # client = CustomOllamaClient(host='http://172.20.0.93:8501/v1', api_key='ics-bsh8ikmnbs23ulsaj90olsbncs2890ws')
